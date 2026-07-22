@@ -1,0 +1,433 @@
+-- allium: 3
+-- professions.allium
+-- Scope: Professions 2.0 crafting, masterwork, archetype identity, recipe acquisition, and the identity nudge journey
+-- Includes: Recipe; craft attempt resolution (reagent, station, combo, skill, throttle, gold-sink guards); the single-draw masterwork proc; the ten-craft skill wheel; archetype identity (active pair, hobby, attuned history, make-amends switching); recipe learning via trainer/drop/quest and grandfathering; tier-crossing and guild-letter nudges
+-- Excludes: gathering node placement, harvest loot tables, and corpse-component rewards (gathering domain); raw item definitions and item-budget math (items domain); enchanting application, disenchant, and salvage wiring; inventory, bag, and persistence shape; i18n, UI, and wire-protocol detail; tool-charge and recharge tuning
+
+config {
+  HOBBY_CEILING_TIER: Integer = 2,
+  DORMANT_CEILING_TIER: Integer = 0,
+  CRAFT_THROTTLE_MAX_PER_WINDOW: Integer = 100,
+  GUILD_LETTER_TIER_THRESHOLD: Integer = 25,
+  TIER_SKILL_STEP: Integer = 25,
+  SWITCH_BASE_AMENDS: Integer = 5,
+  SWITCH_PER_PRIOR_AMENDS: Integer = 3,
+  COPPER_PER_BUDGET: Integer = 1
+}
+
+-- A ring of ten crafts. Adjacency defines which pairs are legal archetype
+-- majors; the craft opposite a major on the ring is its hobby candidate.
+entity Craft {
+  neighborA: Craft,
+  neighborB: Craft,
+  opposite: Craft
+}
+
+-- Static recipe data (declared content, not state). grandfathered recipes
+-- (the pre-training set) are known to every character without a learn step.
+entity Recipe {
+  craft: Craft,
+  resultItemId: String,
+  resultCount: Integer,
+  skillReq: Integer,
+  itemLevelBudget: Integer,
+  grandfathered: Boolean,
+  reagents: List<Reagent>,
+  stationType: String,
+  combo: ComboRequirement,
+  acquisition: List<Source>
+}
+
+-- One reagent line of a recipe: which item, how many units (before discounts).
+entity Reagent {
+  itemId: String,
+  count: Integer,
+  recipe: Recipe
+}
+
+-- A dual-craft gate some recipes carry: only the exact unordered adjacent
+-- pair, with both crafts at or above minTier, satisfies it.
+entity ComboRequirement {
+  craftA: Craft,
+  craftB: Craft,
+  minTier: Integer,
+  recipe: Recipe
+}
+
+enum Source {
+  trainer
+  drop
+  quest
+}
+
+-- A character's craft-side state: the copper sink balance, the rolling
+-- craft-throttle window, the one-shot nudge flags, the grandfathering flag,
+-- and the identity sub-state.
+entity Character {
+  copper: Integer,
+  throttleCount: Integer,
+  throttleWindowStart: Timestamp,
+  guildLetterSent: Boolean,
+  tierMailSent: Set<String>,
+  recipesGrandfathered: Boolean,
+  identity: ProfessionIdentity,
+  mobileStation: MobileStation
+}
+
+-- Per-craft flat skill counter. Additive only: never drains.
+entity CraftSkill {
+  character: Character,
+  craft: Craft,
+  value: Integer
+}
+
+-- Association: a character knows a recipe (learned or grandfathered).
+entity KnownRecipe {
+  character: Character,
+  recipe: Recipe
+}
+
+-- The archetype identity sub-state for one character. The unattuned state is
+-- activeMajor = null; once attuned, exactly one active adjacent pair (active
+-- major + paired major) and zero or one hobby craft are set. attunedPairs is
+-- the history that distinguishes first-time lore attunement from a return
+-- that owes make-amends.
+entity ProfessionIdentity {
+  activeMajor: Craft,
+  pairedMajor: Craft,
+  hobbyCraft: Craft,
+  attunedPairs: Set<String>,
+  switchCount: Integer,
+  amendsProgress: Integer,
+  character: Character
+}
+
+-- A specialist's temporary field station: stands in for physical station
+-- presence while active. Expires at a fixed tick; transient, never persisted.
+entity MobileStation {
+  owner: Character,
+  craft: Craft,
+  expiresAt: Timestamp
+}
+
+-- A craft attempt resolves to exactly one of two terminal outcomes. done
+-- means every guard passed, reagents were consumed, and the output was
+-- granted; denied means some guard failed and no side effect ran. drawCount
+-- pins the single-draw contract (one on done, zero on denied).
+entity CraftAttempt {
+  crafter: Character,
+  recipe: Recipe,
+  reason: String,
+  drawCount: Integer,
+  status: denied | done,
+  transitions status {
+    terminal: denied, done
+  }
+}
+
+-- Emitted exactly once per successful craft: the deterministic output. The
+-- rare-or-better single copy is signed for attribution; this spec records
+-- only the deterministic-grant fact plus the crafter and recipe (the inputs
+-- the masterwork and skill-gain rules read).
+entity CraftOutput {
+  crafter: Character,
+  recipe: Recipe
+}
+
+-- Emitted when the single masterwork draw hits AND the archetype ceiling
+-- permits the bump for this craft. The bump is exactly one quality tier.
+entity MasterworkProc {
+  crafter: Character,
+  recipe: Recipe,
+  bumpedQuality: String
+}
+
+-- Emitted once, the first time a major craft crosses a TIER_SKILL_STEP
+-- boundary after attunement. One per (character, craft, tier).
+entity TierMail {
+  recipient: Character,
+  craft: Craft,
+  tier: Integer
+}
+
+-- Emitted once per character when their leading craft-trend pair first
+-- crosses the Guild's attention threshold, before any attunement.
+entity GuildLetter {
+  recipient: Character
+}
+
+-- External trigger surfaces (player commands and the deterministic tick).
+-- These arrive from outside the spec; no local rule emits them.
+surface CraftCommand {
+  crafter: Character,
+  recipe: Recipe
+}
+
+surface AcquireCommand {
+  character: Character,
+  recipe: Recipe,
+  source: Source
+}
+
+surface TrainCommand {
+  student: Character,
+  recipe: Recipe
+}
+
+surface AttuneCommand {
+  character: Character,
+  pairTarget: String,
+  mode: String
+}
+
+surface HobbyCommand {
+  character: Character,
+  target: Craft
+}
+
+surface Tick {
+  t: Timestamp
+}
+
+-- Crafting: the happy path. Every guard is checked before any side effect.
+-- On success: reagents consumed, gold sink paid (floored at zero so a broke
+-- character still crafts), throttle advanced, output granted, and the
+-- masterwork draw runs (exactly once, see SingleDrawPerCraft).
+rule ResolveCraft {
+  when: CraftCommand(crafter, recipe),
+  requires: KnownRecipe.where(character = crafter, recipe = recipe).count >= 1,
+  requires: recipe.stationType = null or AtStationFor(crafter, recipe.stationType) or MobileStationSatisfies(crafter, recipe.stationType),
+  requires: recipe.combo = null or MeetsCombo(crafter, recipe.combo),
+  requires: HoldsAll(crafter, recipe.reagents),
+  requires: crafter.throttleCount < CRAFT_THROTTLE_MAX_PER_WINDOW,
+  ensures: CraftAttempt.status = done,
+  ensures: CraftAttempt.drawCount = 1,
+  ensures: CraftAttempt.reason = "",
+  ensures: crafter.throttleCount = crafter.throttleCount + 1,
+  ensures: crafter.copper = CraftSink(crafter.copper, recipe.itemLevelBudget),
+  ensures: CraftOutput.created(crafter, recipe)
+}
+
+-- Crafting: a single guard failure denies with a stable reason code and no
+-- side effect. The guard order mirrors the authoritative resolver: unknown
+-- recipe, station, combo, knowledge, reagents, then throttle.
+rule DenyCraft {
+  when: CraftCommand(crafter, recipe),
+  requires: not (KnownRecipe.where(character = crafter, recipe = recipe).count >= 1 and (recipe.stationType = null or AtStationFor(crafter, recipe.stationType) or MobileStationSatisfies(crafter, recipe.stationType)) and (recipe.combo = null or MeetsCombo(crafter, recipe.combo)) and HoldsAll(crafter, recipe.reagents) and crafter.throttleCount < CRAFT_THROTTLE_MAX_PER_WINDOW),
+  ensures: CraftAttempt.status = denied,
+  ensures: CraftAttempt.drawCount = 0,
+  ensures: CraftAttempt.reason = ReasonFor(crafter, recipe)
+}
+
+-- The masterwork proc. Triggered by every CraftOutput. This rule draws the
+-- SINGLE rng value of the craft (MasterworkDrawHits is exactly one
+-- ctx.rng.next() draw against the proc chance); the draw is unconditional
+-- on the success path, and SingleDrawPerCraft pins the one-draw-per-craft
+-- contract. The EFFECT is gated by the bumped tier staying within the
+-- crafter's archetype ceiling for this craft; when gated off, the draw is
+-- still consumed (preserving draw order across hosts) but no masterwork is
+-- minted and the craft stands as a plain deterministic output.
+rule RollMasterwork {
+  when: e: CraftOutput.created,
+  requires: MasterworkDrawHits(e.crafter, e.recipe),
+  requires: BumpedTier(e.recipe) <= CeilingFor(e.crafter, e.recipe.craft),
+  ensures: MasterworkProc.created(e.crafter, e.recipe, BumpedQuality(e.recipe))
+}
+
+-- Skill gain on a successful craft. Full at or below the archetype ceiling,
+-- reduced one tier under raw capability, zero two-or-more under, and zero
+-- for any recipe tiered ABOVE the archetype ceiling (a dormant craft never
+-- climbs past its cap this way). The flat counter only ever goes up.
+rule GainCraftSkill {
+  when: e: CraftOutput.created,
+  requires: TierForSkill(e.recipe.skillReq) <= CeilingFor(e.crafter, e.recipe.craft),
+  let gain = SkillGainFor(e.crafter, e.recipe),
+  ensures: CraftSkill.value = CraftSkill.value + gain
+}
+
+-- Recipe acquisition from one of the recipe's listed sources. Denies (no
+-- effect) when the recipe is already known or the source is not listed.
+-- Acquisition is orthogonal to tier: knowing a recipe and crafting it at
+-- tier are separate gates.
+rule LearnRecipe {
+  when: AcquireCommand(character, recipe, source),
+  requires: source in recipe.acquisition,
+  requires: KnownRecipe.where(character = character, recipe = recipe).count = 0,
+  ensures: KnownRecipe.created(character, recipe)
+}
+
+-- One-time grandfathering of the pre-training recipe set into a character's
+-- known set. Idempotent: re-running on an already-grandfathered character
+-- changes nothing. Runs once per character, recorded by a persisted flag.
+rule GrandfatherRecipes {
+  when: e: Tick.t <= now,
+  for c in Character where c.recipesGrandfathered = false:
+    for r in Recipe where r.grandfathered = true:
+      ensures: KnownRecipe.created(c, r) and c.recipesGrandfathered = true
+}
+
+-- Trainer-taught learning at a master's station. The teach gate is the
+-- student's tier in the recipe's own craft reaching the recipe's tier; a
+-- mobile station never satisfies training. The flat fee is a gold sink.
+rule TrainRecipe {
+  when: TrainCommand(student, recipe),
+  requires: trainer in recipe.acquisition,
+  requires: TierOf(student, recipe.craft) >= TierForSkill(recipe.skillReq),
+  requires: student.copper >= TrainingFeeFor(recipe.itemLevelBudget),
+  requires: KnownRecipe.where(character = student, recipe = recipe).count = 0,
+  ensures: KnownRecipe.created(student, recipe),
+  ensures: student.copper = student.copper - TrainingFeeFor(recipe.itemLevelBudget)
+}
+
+-- First-time archetype attunement (the lore acceptance quest). Sets the
+-- active pair, defaults the hobby to the higher-skill opposite candidate,
+-- seeds attunedPairs with the pair, and leaves switchCount at zero (new
+-- pairs never raise the return-escalation counter).
+rule AcceptFirstArchetype {
+  when: AttuneCommand(character, pairTarget, mode),
+  requires: character.identity.activeMajor = null,
+  requires: mode = "new",
+  requires: IsAdjacentPairTarget(pairTarget),
+  let pair = CraftsFor(pairTarget),
+  ensures: character.identity.activeMajor = pair.craftA,
+  ensures: character.identity.pairedMajor = pair.craftB,
+  ensures: character.identity.hobbyCraft = DefaultHobbyFor(character, pair),
+  ensures: pairTarget in character.identity.attunedPairs
+}
+
+-- Switching to a NEW pair via the repeatable make-amends quest. A first
+-- visit to a never-held pair is free of escalation. Both majors and the
+-- hobby are rederived deterministically from the target pair.
+rule SwitchArchetypePair {
+  when: AttuneCommand(character, pairTarget, mode),
+  requires: character.identity.activeMajor != null,
+  requires: CurrentPair(character.identity) != pairTarget,
+  requires: IsAdjacentPairTarget(pairTarget),
+  requires: mode = "new",
+  requires: not (pairTarget in character.identity.attunedPairs),
+  let pair = CraftsFor(pairTarget),
+  ensures: character.identity.activeMajor = pair.craftA,
+  ensures: character.identity.pairedMajor = pair.craftB,
+  ensures: character.identity.hobbyCraft = DefaultHobbyFor(character, pair),
+  ensures: pairTarget in character.identity.attunedPairs,
+  ensures: character.identity.amendsProgress = 0
+}
+
+-- Returning to a HELD pair requires the make-amends threshold and bumps
+-- switchCount by one. The escalation is 5 + 3 per prior switch.
+rule ReturnArchetypePair {
+  when: AttuneCommand(character, pairTarget, mode),
+  requires: character.identity.activeMajor != null,
+  requires: CurrentPair(character.identity) != pairTarget,
+  requires: IsAdjacentPairTarget(pairTarget),
+  requires: mode = "return",
+  requires: pairTarget in character.identity.attunedPairs,
+  requires: character.identity.amendsProgress >= SWITCH_BASE_AMENDS + SWITCH_PER_PRIOR_AMENDS * character.identity.switchCount,
+  let pair = CraftsFor(pairTarget),
+  ensures: character.identity.activeMajor = pair.craftA,
+  ensures: character.identity.pairedMajor = pair.craftB,
+  ensures: character.identity.hobbyCraft = DefaultHobbyFor(character, pair),
+  ensures: character.identity.amendsProgress = 0,
+  ensures: character.identity.switchCount = character.identity.switchCount + 1
+}
+
+-- Changing the hobby craft (the rare-capped third craft). Valid only for a
+-- candidate opposite one of the two current majors, and never equal to the
+-- current hobby. Does not touch either major or switchCount.
+rule SwitchHobby {
+  when: HobbyCommand(character, target),
+  requires: character.identity.activeMajor != null,
+  requires: target != character.identity.hobbyCraft,
+  requires: target = character.identity.activeMajor.opposite or target = character.identity.pairedMajor.opposite,
+  ensures: character.identity.hobbyCraft = target
+}
+
+-- The Guild trend letter: a one-shot per character. Fires only while the
+-- character is still unattuned (no active archetype, no attuned history)
+-- and their leading adjacent-pair trend has crossed the Guild threshold.
+-- Evaluated on the mail-phase tick (1 Hz).
+rule SendGuildLetter {
+  when: e: Tick.t <= now,
+  for c in Character:
+    if not c.guildLetterSent and c.identity.activeMajor = null and c.identity.attunedPairs.count = 0 and LeadingTrendScore(c) >= GUILD_LETTER_TIER_THRESHOLD:
+      ensures: GuildLetter.created(c) and c.guildLetterSent = true
+}
+
+-- Tier-crossing congratulation mail from the attuned archetype's anchor
+-- master. Fires the first time a MAJOR craft crosses a tier boundary, never
+-- for hobby or dormant crafts, never for unattuned characters. One per
+-- (character, craft, tier); cadence-safe by the per-tier flag set.
+rule SendTierMail {
+  when: e: Tick.t <= now,
+  for c in Character:
+    if c.identity.activeMajor != null and TierOf(c, c.identity.activeMajor) > 0 and not (TierKey(c.identity.activeMajor, TierOf(c, c.identity.activeMajor)) in c.tierMailSent):
+      ensures: TierMail.created(c, c.identity.activeMajor, TierOf(c, c.identity.activeMajor)) and TierKey(c.identity.activeMajor, TierOf(c, c.identity.activeMajor)) in c.tierMailSent
+}
+
+-- The load-bearing determinism contract: every successful craft performs
+-- exactly one rng draw (the masterwork proc draw). Every denial draws
+-- nothing. This is the pinned draw-order invariant the three hosts share.
+invariant SingleDrawPerCraft {
+  for a in CraftAttempt:
+    (a.status = done implies a.drawCount = 1) and (a.status = denied implies a.drawCount = 0)
+}
+
+-- A character holds at most one active archetype pair at a time. The pair
+-- is exactly the (activeMajor, pairedMajor) tuple; both are non-null once
+-- attuned, and both null before the acceptance quest. This is the
+-- at-most-two-active-crafts cap (the two neighbouring majors).
+invariant AtMostOneActivePair {
+  for c in Character:
+    (c.identity.activeMajor = null implies c.identity.pairedMajor = null) and (c.identity.activeMajor != null implies c.identity.pairedMajor != null)
+}
+
+-- The paired major is ring-adjacent to the active major. The ring geometry
+-- is the load-bearing constraint that makes the four wave-one archetypes
+-- (Smith, Outfitter, Apothecary, Bombardier) expressible.
+invariant ActivePairIsRingAdjacent {
+  for i in ProfessionIdentity where i.activeMajor != null:
+    i.pairedMajor = i.activeMajor.neighborA or i.pairedMajor = i.activeMajor.neighborB
+}
+
+-- Craft skill is purely additive: a counter never decreases, and gaining in
+-- one craft never draws down another. The ten crafts are independent.
+invariant SkillIsAdditive {
+  for s in CraftSkill:
+    s.value >= 0
+}
+
+-- Every grandfathered recipe is in every character's known set once the
+-- one-time backfill has run. A character never loses a recipe they could
+-- craft before trainer-taught acquisition landed.
+invariant GrandfatheredRecipesKnown {
+  for c in Character where c.recipesGrandfathered = true:
+    for r in Recipe where r.grandfathered = true:
+      KnownRecipe.where(character = c, recipe = r).count >= 1
+}
+
+-- The masterwork bump never exceeds the crafter's archetype-derived ceiling
+-- for that craft: unlimited for either major, capped at the hobby ceiling
+-- for the hobby craft, capped at the dormant ceiling for every other craft
+-- once attuned (and at the hobby ceiling for every craft before attunement).
+-- A dormant craft never masterworks at all.
+invariant MasterworkRespectsCeiling {
+  for m in MasterworkProc:
+    BumpedTier(m.recipe) <= CeilingFor(m.crafter, m.recipe.craft)
+}
+
+-- The Guild letter fires at most once per character: once the flag is set,
+-- no later trend crossing (and no later attunement state change) can book a
+-- second copy.
+invariant GuildLetterOncePerCharacter {
+  for c in Character where c.guildLetterSent = true:
+    GuildLetter.where(recipient = c).count <= 1
+}
+
+-- Tier-crossing mail is at most one per (character, craft, tier): the
+-- per-tier flag set in tierMailSent prevents duplicate mail for the same
+-- crossing.
+invariant TierMailOncePerCrossing {
+  for c in Character:
+    for m in TierMail where m.recipient = c:
+      TierMail.where(recipient = c, craft = m.craft, tier = m.tier).count <= 1
+}

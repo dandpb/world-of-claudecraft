@@ -1,0 +1,745 @@
+-- allium: 3
+-- moderation-admin.allium
+-- Scope: the admin/moderator authorization model (roles, permissions, the fail-closed route gate), the moderator sanction surface (suspend, ban, chat-mute, jail, force-rename, note), the player-submitted bug-report lane, the two-tier chat filter and its escalation ladder, the anti-bot suspicion boundary, and the dev-command cheat gate that must stay off in production.
+-- Includes: Account (moderation target / bug reporter / chatter / authenticated admin actor, modelled by its roles and effective permissions), ModeratorAction (the audit row), JailSentence, BugReport, FilterWord, FilterConfig, ChatMessage (filtering facet), ChatStrike state, SuspicionScore, AntibotConfig, AntibotConfigChange, RoleChangeAudit, DevCommand, IpBlock; the EffectivePermissionsAreRoleUnion, ReplaceStaffRoles, AdminSanction, AdminChatMute, AdminLiftMute, AdminResetStrikes, AdminForceRename, AdminNote, AdminJail, AdminUnjail, JailSentenceExpires, SubmitBugReport, TriageBugReport, FilterChatMessage, EscalateHardWordStrike, AddFilterWord, RemoveFilterWord, UpdateFilterConfig, BlockIp, UnblockIp, ScoreSuspicion, SaveAntibotConfig, RunDevCommand rules; the dev-gate, fail-closed-route, staff.manage superadmin-only, admin-shielded-from-sanction, jail-confines-and-blocks, hard-tier-sole-punitive-trigger, mute-never-shortens, suspicion-server-only, role-revocation-kicks-live, superadmin-not-dashboard-grantable, bug-report-rate-limit, soft-tier-cosmetic-only invariants.
+-- Excludes: the REST request pipeline mechanics, middleware onion, and envelope shape (rest-pipeline spec); auth identity, token format, scrypt, and session lifecycle (auth-accounts spec); the in-game chat HUD and routing (hud spec); the wire protocol and WS dispatch (net spec); SQL, pg pool, JSONB row shapes, advisory locks, and DB indexing; the internal/secret-gated ops endpoints; map editor moderation (unpublish / asset block) and daily-rewards ledger detail (only the moderation-action facet is modelled); anti-bot heuristic internals (only the scoring boundary and config surface are modelled); screenshot byte storage and mime validation internals (only the storable predicate is modelled).
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The closed set of staff roles. Effective permissions are the union over the
+-- bundle each held role grants; nobody is assigned permissions directly.
+enum AdminRole {
+    superadmin
+    | admin
+    | moderator
+    | viewer
+}
+
+-- The sanction kinds recorded on the moderation audit row. The four
+-- account-state sanctions (suspend / unsuspend / ban / unban) share one route;
+-- the rest are literal sibling routes that sort ahead of the enum.
+enum ModerationActionKind {
+    suspend
+    | unsuspend
+    | ban
+    | unban
+    | chat_mute
+    | lift_mute
+    | kick
+    | kill
+    | force_rename
+    | daily_rewards_ban
+    | daily_rewards_unban
+    | note
+}
+
+enum WordTier {
+    soft
+    | hard
+}
+
+-- The chat filter outcome for one submitted message.
+enum ChatOutcome {
+    delivered
+    | masked_client_only
+    | blocked_warned
+    | blocked_muted
+}
+
+enum JailStatus {
+    active
+    | released
+}
+
+enum BugStatus {
+    open
+    | triaged
+    | ignored
+}
+
+enum SuspicionState {
+    clean
+    | suspicious
+    | confirmed
+}
+
+-- The two-tier chat filter escalation config. The first warningsBeforeMute
+-- offenses are warnings; subsequent offenses walk muteLadderSeconds, clamping
+-- at its final entry.
+value EscalationConfig {
+    warningsBeforeMute: Integer,
+    muteLadderSeconds: List<Integer>
+}
+
+value Vec2 {
+    x: Integer,
+    z: Integer
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The dev-command cheat gate. MUST be false in production.
+    ALLOW_DEV_COMMANDS: Boolean = false,
+    SUPERADMIN_ROLE: AdminRole = superadmin,
+    BUG_DESCRIPTION_MAX: Integer = 2000,
+    BUG_SCREENSHOT_MAX: Integer = 921600,
+    BUG_REPORT_RATE_LIMIT: Integer = 5,
+    BUG_REPORT_RATE_WINDOW: Duration = 3600,
+    MODERATION_REASON_MAX: Integer = 500,
+    JAIL_MINUTE_MAX: Integer = 5256000,
+    CHAT_FILTER_DEFAULT_WARNINGS: Integer = 1,
+    ACCOUNT_NOTE_MAX: Integer = 500,
+    ANTIBOT_CONFIG_NOTE_MAX: Integer = 500
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The production environment flag. ALLOW_DEV_COMMANDS must never be true here.
+entity ProductionEnvironment {
+    isProduction: Boolean
+}
+
+-- The authoritative bot detector lives behind a host seam; only its observable
+-- boundary is modelled. It consumes behavioural observations and emits a
+-- suspicion score plus an enforcement action; the heuristics themselves are
+-- out of scope.
+entity BotDetector {
+    enforce: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A game account. Carries the moderation-relevant state: sanction flags, the
+-- chat strike and mute state the filter escalates, the admin roles that make
+-- it staff, and its derived effective permissions. The same record is the
+-- target of sanctions, the reporter of bugs, and the sender of chat.
+entity Account {
+    id: Integer,
+    username: String,
+    adminRoles: Set<AdminRole>,
+    adminPermissions: Set<String>,
+    isStaff: Boolean,
+    banned: Boolean,
+    suspendedUntil: Timestamp,
+    deactivated: Boolean,
+    chatStrikes: Integer,
+    chatMutedUntil: Timestamp,
+    dailyRewardsBanned: Boolean,
+    dailyRewardsBannedUntil: Timestamp,
+    jailed: JailSentence,
+    suspicion: SuspicionScore
+}
+
+-- One row in the append-only moderation audit trail. Every punitive or
+-- non-punitive admin write lands here, attributed to the actor, before any
+-- live effect. The row is append-only: nothing transitions it after creation.
+entity ModeratorAction {
+    target: Account,
+    actor: Account,
+    kind: ModerationActionKind,
+    reason: String,
+    expiresAt: Timestamp,
+    recordedAt: Timestamp
+}
+
+-- A jail sentence confines a character to the jail cage for a fixed duration.
+-- There is no indefinite form: early release is /unjail or the timed expiry,
+-- whichever comes first. State is per-session and restored on reconnect.
+entity JailSentence {
+    target: Account,
+    sentencedBy: Account,
+    status: JailStatus,
+    sentencedAt: Timestamp,
+    until: Timestamp,
+    reason: String,
+    returnPos: Vec2,
+    transitions status {
+        active -> released,
+        terminal: released
+    }
+}
+
+-- A player-submitted technical bug report (a separate lane from
+-- player-vs-player moderation reports). Rate-limited per account; the body and
+-- screenshot are sanitized at the data layer before storage.
+entity BugReport {
+    submittedBy: Account,
+    characterName: String,
+    realm: String,
+    description: String,
+    hasScreenshot: Boolean,
+    status: BugStatus,
+    submittedAt: Timestamp,
+    transitions status {
+        open -> triaged,
+        open -> ignored,
+        triaged -> ignored,
+        terminal: ignored
+    }
+}
+
+-- One admin-managed entry in the chat filter word list. soft words are
+-- cosmetic (client-masked only); hard words are the sole punitive trigger.
+entity FilterWord {
+    word: String,
+    tier: WordTier,
+    addedBy: Account,
+    createdAt: Timestamp
+}
+
+-- The single live escalation config row. Updated wholesale by an admin write;
+-- every change reloads the live filter.
+entity FilterConfig {
+    escalation: EscalationConfig,
+    updatedAt: Timestamp
+}
+
+-- A chat message passing through the server filter. The hard tier is enforced
+-- server-side (block + strike); the soft tier is never altered server-side,
+-- only masked on the client when the player's filter is on.
+entity ChatMessage {
+    sender: Account,
+    text: String,
+    channel: String,
+    hardHit: String,
+    softHit: Boolean,
+    outcome: ChatOutcome,
+    sentAt: Timestamp
+}
+
+-- The per-account chat-moderation state derived from hard-word offenses. The
+-- strike count walks the escalation ladder; the mute extends, never shortening
+-- a longer existing mute.
+entity ChatStrike {
+    account: Account,
+    strikes: Integer,
+    mutedUntil: Timestamp
+}
+
+-- The bot-detector's view of one account. Behavioural signals feed the score
+-- behind the host seam; the score and state live server-side only and never
+-- enter the sim as gameplay state.
+entity SuspicionScore {
+    account: Account,
+    state: SuspicionState,
+    score: Integer,
+    evidence: List<String>,
+    lastEvaluatedAt: Timestamp,
+    transitions state {
+        clean -> suspicious,
+        suspicious -> confirmed,
+        suspicious -> clean,
+        confirmed -> clean,
+        terminal: confirmed
+    }
+}
+
+-- The per-realm bot-detector runtime config override document plus its
+-- append-only before/after audit trail. Validation and live apply happen
+-- inside the detector; this is the persistence boundary.
+entity AntibotConfig {
+    realm: String,
+    data: String,
+    updatedAt: Timestamp,
+    updatedBy: Account
+}
+
+-- One row in the antibot config change audit (before/after document plus the
+-- admin note). Append-only.
+entity AntibotConfigChange {
+    config: AntibotConfig,
+    beforeData: String,
+    afterData: String,
+    note: String,
+    changedBy: Account,
+    changedAt: Timestamp
+}
+
+-- One row in the staff role-change audit. superadmin grants are out of the
+-- dashboard's reach in both directions; own-account edits are refused.
+entity RoleChangeAudit {
+    target: Account,
+    actor: Account,
+    before: Set<AdminRole>,
+    after: Set<AdminRole>,
+    at: Timestamp
+}
+
+-- A dev-command cheat request. Every arm of the dev surface is gated on
+-- ALLOW_DEV_COMMANDS; the gate is set once from the env when the sim is
+-- constructed and is never true in production.
+entity DevCommand {
+    kind: String,
+    senderPid: Integer,
+    payload: String,
+    executedAt: Timestamp,
+    gateOpen: Boolean
+}
+
+-- A blocked IP entry. Adding a block reloads the live list and kicks every
+-- live session on that IP; an expired or removed block re-arms the list.
+entity IpBlock {
+    ip: String,
+    reason: String,
+    createdBy: Account,
+    createdAt: Timestamp,
+    expiresAt: Timestamp
+}
+
+------------------------------------------------------------
+-- Authorization rules
+------------------------------------------------------------
+
+-- An account's effective permissions are the union over the bundles its held
+-- roles grant. An account is staff iff it holds at least one role; no roles
+-- means not staff, which fails the admin gate closed on the next request.
+rule EffectivePermissionsAreRoleUnion {
+    when: AccountRolesChanged(account)
+    let union = PermissionsForRoles(account.adminRoles)
+    ensures: account.adminPermissions = union
+    ensures: account.isStaff = not Empty(account.adminRoles)
+}
+
+-- Replace a target account's dashboard-grantable roles. superadmin is out of
+-- reach in both directions (grant and revoke move only via the grant script),
+-- the actor cannot edit their own roles, and a role change disconnects the
+-- target's live session so a revoked moderator loses in-game commands
+-- immediately.
+rule ReplaceStaffRoles {
+    when: ReplaceStaffRoles(actor, target, roles)
+    requires: actor.permissions.contains("staff.manage")
+    requires: not roles.contains(SUPERADMIN_ROLE)
+    requires: not target.adminRoles.contains(SUPERADMIN_ROLE)
+    requires: target.id != actor.id
+    ensures: RoleChangeAudit.created(target = target, actor = actor, before = target.adminRoles, after = roles, at = now)
+    if not RoleSetsEqual(target.adminRoles, roles):
+        ensures: target.adminRoles = roles
+        ensures: LiveSessionDisconnected(target)
+}
+
+-- A four-arm account-state sanction sharing one route. suspend and ban refuse
+-- to target a staff account; the punitive arms disconnect the live session.
+-- Every arm writes its audit row before the live effect.
+rule AdminSanction {
+    when: AdminSanction(actor, target, kind, reason, expiresAt)
+    requires: actor.permissions.contains("moderation.act")
+    requires: RouteDeclaredFor(method, path, "moderation.act")
+    if kind = suspend or kind = ban:
+        requires: not target.isStaff
+        ensures: ModeratorAction.created(target = target, actor = actor, kind = kind, reason = reason, expiresAt = expiresAt, recordedAt = now, status: resolved)
+        ensures: ApplySanction(target, kind, expiresAt)
+        ensures: LiveSessionDisconnected(target)
+        ensures: SecurityIncidentNotified(target, kind, reason, expiresAt)
+    else:
+        if kind = unban:
+            ensures: target.banned = false
+        if kind = unsuspend:
+            ensures: target.suspendedUntil = Timestamp(0)
+        ensures: ModeratorAction.created(target = target, actor = actor, kind = kind, reason = reason, expiresAt = expiresAt, recordedAt = now, status: resolved)
+}
+
+-- A timed chat mute against a non-staff account. Extends the account-wide mute
+-- and pushes it live; refusal mutates nothing.
+rule AdminChatMute {
+    when: AdminChatMute(actor, target, reason, expiresAt)
+    requires: actor.permissions.contains("moderation.act")
+    requires: not target.isStaff
+    ensures: ModeratorAction.created(target = target, actor = actor, kind = chat_mute, reason = reason, expiresAt = expiresAt, recordedAt = now, status: resolved)
+    ensures: target.chatMutedUntil = LaterOf(target.chatMutedUntil, expiresAt)
+    ensures: LiveChatMutePushed(target, expiresAt, reason)
+}
+
+-- Lift a chat mute. Clears the live mute and writes the audit row.
+rule AdminLiftMute {
+    when: AdminLiftMute(actor, target, reason)
+    requires: actor.permissions.contains("moderation.act")
+    ensures: ModeratorAction.created(target = target, actor = actor, kind = lift_mute, reason = reason, expiresAt = Timestamp(0), recordedAt = now, status: resolved)
+    ensures: target.chatMutedUntil = Timestamp(0)
+    ensures: LiveChatMuteLifted(target)
+}
+
+-- Zero an account's chat strike counter (the moderation "fresh start").
+rule AdminResetStrikes {
+    when: AdminResetStrikes(actor, target)
+    requires: actor.permissions.contains("moderation.act")
+    ensures: ModeratorAction.created(target = target, actor = actor, kind = note, reason = "reset strikes", expiresAt = Timestamp(0), recordedAt = now, status: resolved)
+    ensures: target.chatStrikes = 0
+    ensures: LiveStrikesReset(target)
+}
+
+-- Force a character rename: flag the character and kick the owner so the
+-- rename gate is enforced at next login.
+rule AdminForceRename {
+    when: AdminForceRename(actor, character, reason)
+    requires: actor.permissions.contains("moderation.act")
+    let target = OwnerOf(character)
+    ensures: ModeratorAction.created(target = target, actor = actor, kind = force_rename, reason = reason, expiresAt = Timestamp(0), recordedAt = now, status: resolved)
+    ensures: CharacterFlaggedForRename(character)
+    ensures: LiveSessionDisconnected(target)
+}
+
+-- A non-punitive free-form note appended to the audit log. No account-state
+-- change, no disconnection, no report resolution.
+rule AdminNote {
+    when: AdminNote(actor, target, note)
+    requires: actor.permissions.contains("moderation.act")
+    requires: Length(note) <= ACCOUNT_NOTE_MAX
+    ensures: ModeratorAction.created(target = target, actor = actor, kind = note, reason = note, expiresAt = Timestamp(0), recordedAt = now, status: resolved)
+}
+
+------------------------------------------------------------
+-- Jail rules
+------------------------------------------------------------
+
+-- Jail a character for an explicit, bounded sentence. The target must be
+-- online and non-staff, not already jailed, and the minutes must be in range.
+-- The sentence drops the target from every match queue and teleports them into
+-- the cage; instance-queueing commands are blocked for the duration.
+rule AdminJail {
+    when: AdminJail(actor, target, minutes, reason)
+    requires: actor.permissions.contains("moderation.act")
+    requires: target.jailed = null
+    requires: not target.isStaff
+    requires: minutes >= 1 and minutes <= JAIL_MINUTE_MAX
+    let until = now + minutes * 60
+    ensures: JailSentence.created(target = target, sentencedBy = actor, status: active, sentencedAt = now, until = until, reason = reason, returnPos = CurrentPos(target))
+    ensures: target.jailed = ActiveSentence(target, until)
+    ensures: MatchQueuesDropped(target)
+    ensures: TeleportedToCage(target)
+    ensures: SystemNotified(target, "moved to jail")
+}
+
+-- Early release: clears the prisoner state and restores the pre-jail position.
+rule AdminUnjail {
+    when: AdminUnjail(actor, target)
+    requires: actor.permissions.contains("moderation.act")
+    requires: target.jailed != null
+    ensures: target.jailed.status = released
+    ensures: target.jailed = null
+    ensures: RestoredToPreJailPosition(target)
+    ensures: SystemNotified(target, "released from jail")
+}
+
+-- A timed sentence ends on its own clock. The temporal release is the same
+-- state clear as /unjail; only the notice text differs.
+rule JailSentenceExpires {
+    when: s: JailSentence.until <= now
+    requires: s.status = active
+    ensures: s.status = released
+    ensures: s.target.jailed = null
+    ensures: RestoredToPreJailPosition(s.target)
+    ensures: SystemNotified(s.target, "sentence ended")
+}
+
+------------------------------------------------------------
+-- Bug report rules
+------------------------------------------------------------
+
+-- A player submits a bug report. Rate-limited per account in a trailing
+-- window; the description is bounded and the screenshot is sanitized at the
+-- data layer so no caller can store an arbitrary blob.
+rule SubmitBugReport {
+    when: SubmitBugReport(reporter, description, screenshot, meta)
+    let recent = ReportsByAccountInWindow(reporter, BUG_REPORT_RATE_WINDOW)
+    requires: recent.count < BUG_REPORT_RATE_LIMIT
+    requires: Length(description) <= BUG_DESCRIPTION_MAX
+    requires: IsStorableScreenshot(screenshot)
+    ensures: BugReport.created(submittedBy = reporter, characterName = CurrentCharacterName(reporter), realm = CurrentRealm(reporter), description = description, hasScreenshot = screenshot != null, status: open, submittedAt = now)
+}
+
+-- A staff member triages an open bug report, marking it triaged or ignored.
+rule TriageBugReport {
+    when: TriageBugReport(actor, report, decision, note)
+    requires: actor.permissions.contains("support.read")
+    requires: report.status = open
+    ensures: report.status = decision
+}
+
+------------------------------------------------------------
+-- Chat filter rules
+------------------------------------------------------------
+
+-- Every chat message passes the two-tier filter. A hard-word hit blocks the
+-- message and escalates the sender; a soft-word hit is masked client-side
+-- only, never altered server-side; a clean message is delivered. An empty
+-- hard list enforces nothing.
+rule FilterChatMessage {
+    when: FilterChatMessage(sender, text, channel)
+    let hard = FindHardWord(text, HardWords())
+    let soft = ContainsSoftWord(text, SoftWords())
+    if hard != null:
+        ensures: ChatMessage.created(sender = sender, text = text, channel = channel, hardHit = hard, softHit = false, outcome: blocked_warned, sentAt = now)
+        ensures: HardWordEscalated(sender, hard, channel, text)
+    else:
+        if soft:
+            ensures: ChatMessage.created(sender = sender, text = text, channel = channel, hardHit = "", softHit = true, outcome: masked_client_only, sentAt = now)
+        else:
+            ensures: ChatMessage.created(sender = sender, text = text, channel = channel, hardHit = "", softHit = false, outcome: delivered, sentAt = now)
+}
+
+-- A hard-word offense walks the escalation ladder: the first
+-- warningsBeforeMute offenses are warnings; the rest are timed account-wide
+-- mutes, clamping at the ladder's final entry. The mute extends, never
+-- shortening a longer existing mute.
+rule EscalateHardWordStrike {
+    when: HardWordEscalated(sender, term, channel, text)
+    let previous = sender.chatStrikes
+    let cfg = FilterConfig().escalation
+    let strikes = previous + 1
+    if strikes <= cfg.warningsBeforeMute or Empty(cfg.muteLadderSeconds):
+        ensures: sender.chatStrikes = strikes
+        ensures: ChatStrike.created(account = sender, strikes = strikes, mutedUntil = sender.chatMutedUntil)
+        ensures: ChatViolationLogged(sender, term, channel, text, "warning", 0)
+    else:
+        let idx = Min(strikes - cfg.warningsBeforeMute - 1, cfg.muteLadderSeconds.count - 1)
+        let seconds = cfg.muteLadderSeconds.at(idx)
+        let newMute = now + seconds
+        ensures: sender.chatStrikes = strikes
+        ensures: sender.chatMutedUntil = LaterOf(sender.chatMutedUntil, newMute)
+        ensures: ChatStrike.created(account = sender, strikes = strikes, mutedUntil = sender.chatMutedUntil)
+        ensures: ChatViolationLogged(sender, term, channel, text, "mute", seconds)
+}
+
+-- Add a normalized word to a tier. A word that normalizes to empty is refused;
+-- every accepted edit reloads the live filter and pushes the new soft list to
+-- connected clients.
+rule AddFilterWord {
+    when: AddFilterWord(actor, rawWord, tier)
+    requires: actor.permissions.contains("chatfilter.manage")
+    let word = NormalizeWord(rawWord)
+    requires: word != ""
+    ensures: FilterWord.created(word = word, tier = tier, addedBy = actor, createdAt = now)
+    ensures: LiveFilterReloaded()
+}
+
+rule RemoveFilterWord {
+    when: RemoveFilterWord(actor, word)
+    requires: actor.permissions.contains("chatfilter.manage")
+    ensures: not exists word
+    ensures: LiveFilterReloaded()
+}
+
+-- Replace the escalation config wholesale; reload the live filter afterwards.
+rule UpdateFilterConfig {
+    when: UpdateFilterConfig(actor, warningsBeforeMute, muteLadderSeconds)
+    requires: actor.permissions.contains("chatfilter.manage")
+    let clean = CleanEscalation(warningsBeforeMute, muteLadderSeconds)
+    ensures: FilterConfig().escalation = clean
+    ensures: FilterConfig().updatedAt = now
+    ensures: LiveFilterReloaded()
+}
+
+------------------------------------------------------------
+-- IP block rules
+------------------------------------------------------------
+
+-- Block an IP: reload the live list and kick every live session on that IP.
+-- A valid IP literal is required; an invalid one mutates nothing.
+rule BlockIp {
+    when: BlockIp(actor, ip, reason, expiresAt)
+    requires: actor.permissions.contains("ipblocks.manage")
+    requires: IsValidIp(ip)
+    ensures: IpBlock.created(ip = ip, reason = reason, createdBy = actor, createdAt = now, expiresAt = expiresAt)
+    ensures: LiveBlockedIpsReloaded()
+    ensures: DisconnectByIp(ip)
+}
+
+rule UnblockIp {
+    when: UnblockIp(actor, ip)
+    requires: actor.permissions.contains("ipblocks.manage")
+    ensures: not exists b in IpBlock where b.ip = ip and Live(b)
+    ensures: LiveBlockedIpsReloaded()
+}
+
+------------------------------------------------------------
+-- Anti-bot rules
+------------------------------------------------------------
+
+-- Behavioural observations feed the detector behind the host seam. The score
+-- and state update server-side; the sim never reads either. An enforcement
+-- kick resolves as a forced disconnect that skips the linkdead grace.
+rule ScoreSuspicion {
+    when: BotObservation(account, signal, at)
+    let detector = BotDetector()
+    let result = EvaluateSuspicion(detector, account, signal)
+    ensures: account.suspicion.score = result.score
+    ensures: account.suspicion.state = result.state
+    ensures: account.suspicion.lastEvaluatedAt = at
+    if result.action = kick and detector.enforce:
+        ensures: ForcedDisconnect(account)
+}
+
+-- Save the bot-detector runtime config. The override document is validated and
+-- applied LIVE by the detector; a validation or persistence failure re-applies
+-- the previous effective document. A change that lands appends its audit row
+-- atomically; an unchanged document is a no-op.
+rule SaveAntibotConfig {
+    when: SaveAntibotConfig(actor, overrides, note)
+    requires: actor.permissions.contains("botdetector.configure")
+    requires: Length(note) <= ANTIBOT_CONFIG_NOTE_MAX
+    let previous = EffectiveOverrides()
+    let result = ApplyConfig(BotDetector(), overrides)
+    if result.errors.count > 0:
+        ensures: ApplyConfig(BotDetector(), previous)
+        ensures: ConfigSaveRejected(actor, result.errors)
+    else:
+        let effective = EffectiveOverrides()
+        let stored = AntibotConfig()
+        ensures: stored.data = Encode(effective)
+        ensures: stored.updatedAt = now
+        ensures: stored.updatedBy = actor
+        ensures: AntibotConfigChange.created(config = stored, beforeData = Encode(previous), afterData = Encode(effective), note = note, changedBy = actor, changedAt = now)
+}
+
+------------------------------------------------------------
+-- Dev command gate
+------------------------------------------------------------
+
+-- The /dev cheat surface (level, teleport, give, spawn, gold, quest, dungeon,
+-- raid, etc.) is gated on ALLOW_DEV_COMMANDS. The gate is read from the env
+-- once when the sim is constructed and mirrored onto every dispatch arm; a
+-- request that arrives with the gate closed is silently dropped (no effect, no
+-- error), so production never exposes the surface even to a forged client.
+rule RunDevCommand {
+    when: RunDevCommand(sender, kind, payload)
+    requires: ALLOW_DEV_COMMANDS = true
+    requires: not IsProductionEnv()
+    ensures: DevCommand.created(kind = kind, senderPid = sender, payload = payload, executedAt = now, gateOpen = true)
+    ensures: CheatApplied(sender, kind, payload)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The hard rule: ALLOW_DEV_COMMANDS must NEVER be true in production. Every
+-- dev command arm requires the gate, and the gate is closed in every
+-- production boot.
+invariant DevCommandsNeverInProduction {
+    for e in ProductionEnvironment:
+        e.isProduction implies ALLOW_DEV_COMMANDS = false
+    for d in DevCommand:
+        d.gateOpen = true implies ALLOW_DEV_COMMANDS = true
+    for e in ProductionEnvironment:
+        e.isProduction implies not exists d in DevCommand where d.gateOpen = true
+}
+
+-- Every admin route is declared with a permission and fails closed: a route
+-- missing from the table can never execute, and a route whose declared
+-- permission the actor lacks is refused before any handler runs.
+invariant EveryAdminRouteFailsClosed {
+    for r in AdminRoute:
+        DeclaredPermission(r) != null
+    for r in AdminRoute:
+        (DeclaredPermission(r) != "any" and not ActorHasPermission(r.caller, DeclaredPermission(r))) implies Refused(r)
+}
+
+-- staff.manage (grant/revoke roles) is the privilege-escalation vector, so it
+-- is reachable ONLY through superadmin. No dashboard-grantable role, not even
+-- the otherwise-everything admin role, carries it.
+invariant StaffManageIsSuperadminOnly {
+    for a in Account:
+        a.adminPermissions.contains("staff.manage") implies a.adminRoles.contains(SUPERADMIN_ROLE)
+    for r in AdminRole:
+        r != superadmin implies not RoleGrants(r, "staff.manage")
+}
+
+-- superadmin is grantable only via the grant script or SQL, never from the
+-- dashboard. Both granting and revoking superadmin through the staff API are
+-- refused; a target that already holds superadmin is untouchable there.
+invariant SuperadminNotDashboardGrantable {
+    for a in RoleChangeAudit:
+        not a.before.contains(SUPERADMIN_ROLE) and not a.after.contains(SUPERADMIN_ROLE)
+    for a in RoleChangeAudit:
+        not a.after.contains(SUPERADMIN_ROLE)
+}
+
+-- Staff accounts are shielded from the punitive sanctions: suspend, ban, and
+-- chat-mute all refuse a staff target. A staff password reset requires a
+-- superadmin actor (the same shield, narrower authority).
+invariant AdminAccountsShieldedFromSanction {
+    for m in ModeratorAction:
+        (m.kind = suspend or m.kind = ban or m.kind = chat_mute) implies not m.target.isStaff
+    for m in ModeratorAction:
+        (m.kind = suspend or m.kind = ban or m.kind = chat_mute) implies m.target.isStaff = false
+}
+
+-- A jailed character is confined to the cage and blocked from queueing into or
+-- entering instanced content (ranked arena in every format, the Vale Cup,
+-- dungeons, delves, duels, the card minigame). Leave/abort commands stay
+-- allowed. A jailed session never passes the moderator-only cage gate, even a
+-- jailed moderator.
+invariant JailConfinesAndBlocks {
+    for j in JailSentence:
+        j.status = active implies InCage(j.target)
+    for j in JailSentence:
+        j.status = active implies InstanceCommandsBlocked(j.target)
+    for j in JailSentence:
+        j.status = active implies not PassesModeratorGate(j.target)
+}
+
+-- The hard tier is the SOLE punitive chat trigger. Only a whole-token match
+-- against the admin-managed hard list (after leet/confusable/diacritic
+-- normalization) blocks a message and escalates the sender. The soft tier is
+-- purely cosmetic: the server never alters a soft-word message.
+invariant HardTierIsSolePunitiveTrigger {
+    for m in ChatMessage:
+        (m.outcome = blocked_warned or m.outcome = blocked_muted) implies m.hardHit != ""
+    for m in ChatMessage:
+        m.softHit = true implies m.outcome != blocked_warned
+    for m in ChatMessage:
+        m.softHit = true implies m.outcome != blocked_muted
+}
+
+-- Applying a strike never shortens an existing longer mute. A new mute extends
+-- the current deadline via GREATEST; a warning leaves it untouched.
+invariant MuteNeverShortens {
+    for e in EscalationStep:
+        e.previousMutedUntil != null implies e.newMutedUntil >= e.previousMutedUntil
+}
+
+-- The suspicion score and the bot-detector config never enter the sim as
+-- gameplay state. They live server-side only; the sim never reads a score, a
+-- state, or a detector field.
+invariant SuspicionScoreServerOnly {
+    for s in SuspicionScore:
+        not SimReads(s)
+    for c in AntibotConfig:
+        not SimReads(c)
+    for c in AntibotConfigChange:
+        not SimReads(c)
+}
+
+-- A role change disconnects the target's live session, because in-game
+-- permissions are snapshotted at WS join. A revoked moderator loses in-game
+-- commands immediately instead of at the next voluntary relog.
+invariant RoleRevocationKicksLive {
+    for a in RoleChangeAudit:
+        not RoleSetsEqual(a.before, a.after) implies LiveSessionDisconnected(a.target)
+}
+
+-- Bug reports are rate-limited per account in a trailing window. The cap is an
+-- abuse guard; a burst that slips one or two extra through the TOCTOU gap is
+-- harmless (unlike a uniqueness constraint).
+invariant BugReportRateLimited {
+    for a in Account:
+        ReportsByAccountInWindow(a, BUG_REPORT_RATE_WINDOW).count <= BUG_REPORT_RATE_LIMIT + ToleratedBurst()
+}
+
+-- The soft tier is cosmetic only: the server ships the normalized soft list to
+-- each client and never alters a soft-word message on the broadcast path. The
+-- player's own profanity-filter toggle decides whether soft words are masked
+-- on that client.
+invariant SoftTierCosmeticOnly {
+    for m in ChatMessage:
+        m.softHit = true implies ServerBroadcastUnaltered(m)
+}

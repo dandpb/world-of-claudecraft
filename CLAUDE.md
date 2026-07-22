@@ -38,6 +38,7 @@ dependency set. The one sanctioned exception is the standalone admin dashboard
 | `tests/` | Vitest suite (subdirectory map in `tests/CLAUDE.md`). |
 | `scripts/` | Asset/build/i18n/SFX tooling + browser E2E / screenshot scripts. |
 | `public/` · `docs/` | Static assets, **deployed verbatim to the live site** · design + PRD + ops docs. |
+| `specs/` | Allium behavioral specs distilled from the code (`specs/INDEX.md`); hypotheses to validate, never a substitute for the code or these docs. |
 | `mediawiki/` + `deploy/` | Player-wiki container + production first-boot assets (see `DEPLOY.md`). |
 
 Most directories above have their own `CLAUDE.md` with local conventions; read it when you work there.

@@ -1,0 +1,732 @@
+-- allium: 3
+-- server-authority.allium
+-- Scope: the authoritative server tick loop and the online client boundary that mirrors it.
+-- Includes: the 20 Hz authoritative tick (drain intent, step sim, route events, broadcast), the player command surface (validated server-side, resolved in the sim), the interest-scoped snapshot wire contract (client folds, never authors), the connection lifecycle (connecting, connected, linkdead grace, reconnecting, disconnected), jittered backoff with bounded transient-rejection retry, and the server-is-authoritative invariant.
+-- Excludes: the REST pipeline and HTTP routing (rest-pipeline spec), auth and identity (auth-accounts spec), chat and moderation (moderation spec), the sim's internal systems (their own specs), the DB/persistence schema, the ws library, the wire byte format, and the character load lease (persistence spec).
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The shared, host-agnostic simulation core. The server steps it; it never
+-- reaches back into the server or the client. Outcomes (damage, loot, quest
+-- credit, economy, talents) resolve inside it.
+entity Sim {
+    tick_count: Integer
+    time: Integer
+}
+
+-- The player facing the server across the wire. The client is a renderer; it
+-- streams intent and commands and reflects snapshots, nothing more.
+entity Player {
+    account_id: Integer
+    character_id: Integer
+    name: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Vec3 {
+    x: Integer
+    y: Integer
+    z: Integer
+}
+
+-- One frame of movement intent at 20 Hz: directional flags plus the
+-- client-authoritative facing channel (mouselook / keyboard turn).
+value MoveIntent {
+    forward: Boolean
+    back: Boolean
+    turn_left: Boolean
+    turn_right: Boolean
+    strafe_left: Boolean
+    strafe_right: Boolean
+    jump: Boolean
+    facing: Integer
+    seq: Integer
+}
+
+-- A terse wire record of another entity. A "full" record carries identity
+-- (kind, name, level); a "lite" record carries only dynamic fields and rides
+-- on prior identity.
+value WireEntity {
+    id: Integer
+    is_full: Boolean
+    pos: Vec3
+    facing: Integer
+    hp: Integer
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    tick_rate: Integer = 20
+    dt_ms: Integer = 50
+    -- Player and pet interest shells. Entities enter at the inner radius and
+    -- drop at the outer, with hysteresis to stop boundary churn.
+    interest_radius: Integer = 90
+    interest_drop_radius: Integer = 100
+    npc_interest_radius: Integer = 120
+    npc_drop_radius: Integer = 130
+    -- Held movement is zeroed when no input frame has arrived for this long,
+    -- so a dropped or stalled client does not run a stuck move forever.
+    stale_input_seconds: Decimal = 0.75
+    -- A dropped socket is held in-world for this grace so an accidental
+    -- disconnect can resume seamlessly. Forced disconnects skip it.
+    linkdead_grace_ms: Duration = 300.seconds
+    -- Per-account cap on live (non-linkdead) sessions. GMs are exempt.
+    max_active_sessions_per_account: Integer = 1
+    -- Full-jitter exponential reconnect schedule. Jitter exists so a server
+    -- restart does not stampede every client at the same beat.
+    reconnect_base_delay_ms: Duration = 1.seconds
+    reconnect_max_delay_ms: Duration = 15.seconds
+    reconnect_max_attempts: Integer = 40
+    -- Bounded tolerance for the two transient rejection classes; each counter
+    -- resets on the post-reconnect hello.
+    max_conflict_rejections: Integer = 8
+    max_timeout_rejections: Integer = 20
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A server-side per-player session, the unit the authoritative loop drives.
+-- The same character has at most one live session; a dropped socket enters
+-- linkdead grace rather than tearing down, so a reconnect resumes.
+-- Status names are chosen distinct from ClientConnection's so the model is
+-- unambiguous: handshaking = WS accepted awaiting game.join; active = joined
+-- the world and ticking; linkdead = socket dropped, in grace; leaving =
+-- teardown in progress; closed = terminal.
+entity GameSession {
+    player: Player
+    pid: Integer
+    realm: String
+    joined_at: Timestamp
+    last_input_at: Timestamp
+    grace_until: Timestamp
+    sent_ents: Set<Integer>
+    status: handshaking | active | linkdead | leaving | closed
+    transitions status {
+        handshaking -> active
+        active -> linkdead
+        active -> leaving
+        linkdead -> active
+        linkdead -> leaving
+        leaving -> closed
+        terminal: closed
+    }
+}
+
+-- A submitted command awaiting authoritative resolution. The client only
+-- learns the outcome; it never authors one. rid correlates the returned
+-- outcome to the pending send.
+entity PlayerCommand {
+    session: GameSession
+    token: String
+    rid: Integer
+    fields_validated: Boolean
+    resolved: Boolean
+    ok: Boolean
+    status: pending | resolved | rejected
+    transitions status {
+        pending -> resolved
+        pending -> rejected
+        terminal: resolved
+        terminal: rejected
+    }
+}
+
+-- One per-tick, per-session interest-scoped broadcast. The server OMITS heavy
+-- unchanged self fields (delta encoding); the client must guard each one and
+-- keep the prior value, never default to empty.
+entity WorldSnapshot {
+    session: GameSession
+    tick: Integer
+    time: Integer
+    self_state: WireEntity
+    ents: List<WireEntity>
+    keep: Set<Integer>
+    sent_at: Timestamp
+}
+
+-- A per-player event the sim produced (loot, log, error, flair). The client
+-- drains and consumes them for display; it never re-derives an outcome.
+entity SimEvent {
+    session: GameSession
+    kind: String
+    queued_at: Timestamp
+}
+
+-- The client-side connection state machine. Auto-reconnects with jittered
+-- backoff up to the attempt cap; ends fatally on a non-transient server error.
+entity ClientConnection {
+    player: Player
+    realm: String
+    reconnect_attempts: Integer
+    conflict_rejections: Integer
+    timeout_rejections: Integer
+    next_retry_at: Timestamp
+    status: connecting | connected | reconnecting | disconnected
+    transitions status {
+        connecting -> connected
+        connecting -> reconnecting
+        connected -> reconnecting
+        connected -> disconnected
+        reconnecting -> connected
+        reconnecting -> disconnected
+        connecting -> disconnected
+        terminal: disconnected
+    }
+}
+
+-- The presentation-only mirror the client maintains. It is built exclusively
+-- by folding snapshots; no field is ever computed from a command anticipation.
+entity ClientWorldMirror {
+    player: Player
+    entities: Set<Integer>
+    seen_self: Boolean
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The command and intent surface the client faces. Everything crossing it is
+-- untrusted: the server type-checks every field before it reaches the sim.
+surface ClientFacingSurface {
+    facing player: Player
+    context session: GameSession where session.status = active
+
+    exposes:
+        session.pid
+        session.realm
+
+    provides:
+        SubmitIntent(player, session, intent: MoveIntent)
+            when session.status = active
+        SubmitCommand(player, session, command)
+            when session.status = active
+        RequestLogout(player, session)
+            when session.status = active
+}
+
+-- The authoritative loop surface. One process owns one realm; the loop is the
+-- single heartbeat that advances the shared sim for everyone on that realm.
+surface AuthoritativeLoopSurface {
+    facing server: ServerHost
+    context sim: Sim
+
+    provides:
+        StepAuthoritativeTick(server, sim)
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The snapshot fold contract: the client applies a snapshot by folding its
+-- ents and self into the mirror and pruning anything not in ents or keep. It
+-- never derives an outcome, never defaults an omitted delta field, and never
+-- mutates authoritative state. The mirror is a reflection, not a source.
+contract SnapshotApply {
+    apply: (mirror: ClientWorldMirror, snap: WorldSnapshot) -> ClientWorldMirror
+
+    @invariant FoldIsPresentationOnly
+        -- Apply may add, update, or remove reflected entities; it never
+        -- resolves a combat, loot, quest, or economy outcome.
+
+    @invariant OmittedDeltaFieldsAreKept
+        -- Heavy self fields the server omits (cooldowns, inventory, equipment,
+        -- quest log, talents, stats, party) are kept unchanged; a missing
+        -- field is never defaulted to empty.
+
+    @invariant LiteRecordForUnknownIsSkipped
+        -- A lite entity record (no identity fields) for an id the mirror has
+        -- never seen is dropped, never half-initialized.
+
+    @invariant PruneRespectsKeep
+        -- After a fold, the mirror's entity set is exactly (prior intersect
+        -- ents / keep) union ents; an id in keep is never pruned.
+}
+
+-- The command resolution contract: the server is the only authority. A command
+-- may be type-checked, parsed, and routed, but the outcome is decided inside
+-- the sim. The client only learns an ack and observes the next snapshot.
+contract CommandResolution {
+    dispatch: (session: GameSession, cmd: PlayerCommand) -> Boolean
+
+    @invariant EveryFieldValidatedBeforeSim
+        -- No field of a command reaches a sim method until its type and shape
+        -- have been checked; a malformed command is dropped, not applied.
+
+    @invariant OutcomesResolveInSim
+        -- Combat, loot, quest credit, economy, and talent state change only
+        -- inside the sim. The server never short-circuits an outcome itself.
+
+    @invariant OutcomeIsObservableViaSnapshot
+        -- A command's effect is communicated to the client only through a
+        -- subsequent snapshot self / ents delta or a SimEvent, never by the
+        -- command return value authoring client state.
+}
+
+------------------------------------------------------------
+-- Rules: the authoritative tick
+------------------------------------------------------------
+
+-- The single heartbeat. Drains stale intent, steps the shared sim at 20 Hz,
+-- routes emitted events to their recipient sessions, then broadcasts. A throw
+-- in any phase is caught and skipped so a transient fault cannot starve every
+-- other session's tick.
+rule StepAuthoritativeTick {
+    when: StepAuthoritativeTick(server, sim)
+    ensures:
+        sim.tick_count = sim.tick_count + 1
+        sim.time = sim.time + config.dt_ms
+}
+
+-- A WS handshake that passes auth creates a session in the handshaking status.
+-- The per-character load lease is acquired between getCharacter and the join
+-- that follows, so two processes can never double-load one character.
+rule HandshakeCreatesSession {
+    when: HandshakeAccepted(account_id, character_id, ws)
+    ensures: GameSession.created(
+        player: PlayerFor(account_id, character_id),
+        pid: 0,
+        realm: CurrentRealm(),
+        joined_at: now,
+        last_input_at: 0,
+        grace_until: 0,
+        sent_ents: {},
+        status: handshaking
+    )
+}
+
+-- A successful game.join (fresh character or resumed session) moves the
+-- session into active and starts the sim entity ticking for it.
+rule JoinActivatesSession {
+    when: s: GameSession.created
+    requires: s.status = handshaking
+    requires: JoinAuthorized(s)
+    ensures: s.status = active
+    ensures: s.pid = AssignedPid(s)
+    ensures: s.last_input_at = SimStartTime(s)
+}
+
+-- Held movement is zeroed once no input frame has arrived within the stale
+-- window, so a dropped client cannot keep running a held direction forever.
+rule ClearStaleInputs {
+    when: StepAuthoritativeTick(server, sim)
+    for session in GameSession where session.status = active and sim.time - session.last_input_at > config.stale_input_seconds:
+        ensures: HoldMoveZeroed(session)
+}
+
+-- A submitted intent frame refreshes the input liveness clock. The facing
+-- channel is applied outright (a released spirit turns with the camera; an
+-- un-released corpse keeps its facing frozen); the rest of the intent is
+-- copied onto the session's move input for the next sim tick.
+rule ReceiveIntent {
+    when: SubmitIntent(player, session, intent)
+    requires: session.status = active
+    let sim = SimOf(session)
+    ensures: session.last_input_at = sim.time
+    ensures: FacingApplied(session, intent.facing)
+}
+
+-- A submitted command is type-checked field by field before any sim method
+-- runs. A structurally valid, non-jailed-blocked command is created in the
+-- pending status; the dispatch rule then resolves it inside the sim.
+rule SubmitCreatesCommand {
+    when: SubmitCommand(player, session, command)
+    requires: session.status = active
+    let validated = ValidateFields(command)
+    ensures: PlayerCommand.created(
+        session: session,
+        token: command.token,
+        rid: command.rid,
+        fields_validated: validated,
+        resolved: false,
+        ok: false,
+        status: pending
+    )
+}
+
+-- A validated command for a non-jailed session is resolved inside the sim.
+-- The ok flag and the SimEvent / snapshot delta carry the outcome; the command
+-- itself carries no authoritative state back to the client.
+rule DispatchValidatedCommand {
+    when: c: PlayerCommand.created
+    requires: c.status = pending
+    requires: c.fields_validated
+    requires: not JailedBlocked(c.session, c)
+    ensures: c.status = resolved
+    ensures: c.resolved = true
+    ensures: c.ok = SimResolved(c)
+    ensures: CommandOutcome(session = c.session, rid = c.rid, ok = c.ok)
+    ensures: RoutedToSim(c.session, c)
+}
+
+-- A malformed command (any field failed validation) is rejected before it can
+-- reach a sim method. It is flagged as a protocol anomaly; nothing is applied.
+rule RejectMalformedCommand {
+    when: c: PlayerCommand.created
+    requires: c.status = pending
+    requires: not c.fields_validated
+    ensures: c.status = rejected
+    ensures: ProtocolAnomaly(c.session, c)
+}
+
+-- A jailed session is blocked from the instance-enrolling command set before
+-- dispatch, so a popped match or instance entry cannot teleport it out of the
+-- cage (and straight back). The outcome is reported as a failure.
+rule RejectJailedCommand {
+    when: c: PlayerCommand.created
+    requires: c.status = pending
+    requires: c.fields_validated
+    requires: JailedBlocked(c.session, c)
+    ensures: c.status = rejected
+    ensures: CommandOutcome(session = c.session, rid = c.rid, ok = false)
+}
+
+-- A deliberate logout bypasses linkdead grace and tears down immediately. The
+-- subsequent socket close is a no-op against the already-left session.
+rule RequestLogoutBypassesGrace {
+    when: RequestLogout(player, session)
+    requires: session.status = active
+    ensures: session.status = leaving
+}
+
+------------------------------------------------------------
+-- Rules: interest scoping and broadcast
+------------------------------------------------------------
+
+-- Each active, non-linkdead session receives a per-tick snapshot whose ents
+-- are exactly the entities within its interest shell. Players and pets use
+-- the narrower shell; NPCs use the wider one; a viewer's current target is
+-- held to the widest drop radius so its unit frame does not vanish
+-- mid-chase. A stealth entity outside its detection radius is unobservable.
+rule BroadcastSnapshot {
+    when: StepAuthoritativeTick(server, sim)
+    for session in GameSession where session.status = active:
+        let shell = InterestShell(session)
+        let in_scope = EntitiesWithin(shell, session.sent_ents)
+        let held = UnchangedHeld(in_scope, session.sent_ents)
+        ensures: WorldSnapshot.created(
+            session: session,
+            tick: sim.tick_count,
+            time: sim.time,
+            self_state: SelfOf(session),
+            ents: in_scope,
+            keep: held,
+            sent_at: now
+        )
+}
+
+-- First sight of an entity carries its full record; subsequent unchanged
+-- records within the settle window ride as a bare id in keep. Once an entity
+-- leaves the interest shell it is forgotten, so a re-entry sends identity
+-- again.
+rule ScopeInterest {
+    when: s: WorldSnapshot.created
+    for id in s.ents:
+        ensures: s.session.sent_ents = s.session.sent_ents + id
+    for id in s.session.sent_ents where not (id in IdsOf(s.ents)) and not (id in s.keep):
+        ensures: s.session.sent_ents = s.session.sent_ents - id
+}
+
+-- Sim-emitted events (loot, log, error, flair) are routed per-tick to the
+-- sessions that should observe them, then folded client-side as SimEvents for
+-- display. They carry outcome DESCRIPTIONS, never authoritative state changes.
+rule RouteSimEvents {
+    when: StepAuthoritativeTick(server, sim)
+    for session in GameSession where session.status = active:
+        for kind in EventsForSession(sim, session):
+            ensures: SimEvent.created(session: session, kind: kind, queued_at: now)
+}
+
+------------------------------------------------------------
+-- Rules: linkdead grace, resume, and forced disconnect
+------------------------------------------------------------
+
+-- An unexpected socket close does not log the character out. The session
+-- becomes linkdead, held in-world for the grace window so a reconnect resumes
+-- seamlessly. Held movement stops; the entity keeps ticking (it can still be
+-- attacked, healed, or die while linkdead).
+rule SocketClosedBeginsLinkdeadGrace {
+    when: SessionSocketClosed(session)
+    requires: session.status = active
+    ensures: session.status = linkdead
+    ensures: session.grace_until = now + config.linkdead_grace_ms
+    ensures: HoldMoveZeroed(session)
+}
+
+-- A deliberate logout or a forced disconnect (moderation, takeover, anti-bot,
+-- account lock) bypasses grace entirely and tears down through the leaving
+-- state. No forced path may half-tear-down a session.
+rule ForcedDisconnectBypassesGrace {
+    when: ForceDisconnect(session, reason)
+    requires: session.status = active or session.status = linkdead
+    ensures: session.status = leaving
+    ensures: session.grace_until = 0
+}
+
+-- The tick sweeps linkdead sessions whose grace has elapsed and tears them
+-- down. The grace is the only thing keeping an accidental drop in-world.
+rule ExpireLinkdeadGrace {
+    when: StepAuthoritativeTick(server, sim)
+    for session in GameSession where session.status = linkdead and session.grace_until <= now:
+        ensures: session.status = leaving
+}
+
+-- Leave cleanup (save, sim removal, lease release, presence offline) is the
+-- terminal transition. Once it begins the session is closed for good; no
+-- reconnect can resume a session whose teardown has started.
+rule LeaveCompletes {
+    when: LeavePersisted(session)
+    requires: session.status = leaving
+    ensures: session.status = closed
+}
+
+-- A reconnect for the same character on the same account resumes the held
+-- linkdead session: the socket is rebound, the status returns to active, and
+-- the next broadcast starts from an empty interest set. The resume never
+-- re-acquires the character load lease (the original still holds it).
+rule ResumeOnReconnect {
+    when: ResumeRequest(account_id, character_id, ws)
+    let held = HeldSessionFor(character_id)
+    requires: held.status = linkdead
+    requires: held.player.account_id = account_id
+    ensures: held.status = active
+    ensures: held.sent_ents = {}
+}
+
+-- A reconnect for the same character while its session is still live (or mid
+-- teardown) is rejected with the transient conflict literal. The client's
+-- reconnect policy tolerates a bounded run of these while the server's
+-- keepalive sweep flips the dead socket linkdead.
+rule RejectConflictWhileLive {
+    when: ResumeRequest(account_id, character_id, ws)
+    let held = HeldSessionFor(character_id)
+    requires: held.status = active or held.status = leaving
+    ensures: ResumeRejected(connection = ReconnectingClient(account_id), reason = ConflictLiteral)
+}
+
+-- Past the grace window, a successful auth reads as a fresh join from the
+-- last save rather than a resume, so retrying stays correct at any point in
+-- the lifecycle.
+rule FreshJoinAfterGrace {
+    when: ResumeRequest(account_id, character_id, ws)
+    let held = HeldSessionFor(character_id)
+    requires: held.status = closed
+    ensures: FreshJoin(account_id, character_id, ws)
+}
+
+------------------------------------------------------------
+-- Rules: client reconnect and resume
+------------------------------------------------------------
+
+-- Opening a socket creates the client connection in connecting; the first
+-- frame sent is the auth frame, then the client waits for hello.
+rule OpenSocketCreatesConnection {
+    when: OpenSocket(player, realm)
+    ensures: ClientConnection.created(
+        player: player,
+        realm: realm,
+        reconnect_attempts: 0,
+        conflict_rejections: 0,
+        timeout_rejections: 0,
+        next_retry_at: now,
+        status: connecting
+    )
+}
+
+-- The first hello on a fresh socket moves the connection into connected. The
+-- post-reconnect hello takes the same path through ReconcileOnHello.
+rule HelloEstablishesConnection {
+    when: HelloReceived(connection)
+    requires: connection.reconnect_attempts = 0
+    requires: connection.status = connecting
+    ensures: connection.status = connected
+}
+
+-- An unexpectedly closed socket moves the connection into reconnecting; the
+-- next rule arms the actual backoff timer. A pending-retry duplicate close
+-- (the zombie-socket case) counts once.
+rule SocketClosedBeginsReconnect {
+    when: ConnectionSocketClosed(connection)
+    requires: connection.status = connected or connection.status = connecting
+    requires: connection.reconnect_attempts < config.reconnect_max_attempts
+    ensures: connection.status = reconnecting
+}
+
+-- An unexpectedly closed socket schedules a reconnect with full-jitter
+-- exponential backoff. The jitter exists so a server blip does not stampede
+-- every client onto the reconnect endpoint on the same beat.
+rule ScheduleReconnectWithBackoff {
+    when: c: ClientConnection.status transitions_to reconnecting
+    requires: c.reconnect_attempts < config.reconnect_max_attempts
+    let step = min(config.reconnect_max_delay_ms, ExponentialStep(c.reconnect_attempts))
+    let jittered = step * JitterFactor()
+    ensures: c.next_retry_at = now + min(config.reconnect_max_delay_ms, jittered)
+    ensures: c.reconnect_attempts = c.reconnect_attempts + 1
+}
+
+-- Past the attempt cap, no further retry: the connection ends fatally and the
+-- disconnect callback fires with the connection-lost literal.
+rule EndSessionOnRetriesExhausted {
+    when: c: ClientConnection.status transitions_to reconnecting
+    requires: c.reconnect_attempts >= config.reconnect_max_attempts
+    ensures: c.status = disconnected
+    ensures: ClientDisconnected(c, reason = ConnectionLostLiteral)
+}
+
+-- The transient conflict rejection ('character already in world') is tolerated
+-- up to the conflict bound: the old socket has not been noticed dead yet, and
+-- the next retry lands once the server keepalive sweep flips it linkdead.
+rule TolerateTransientConflictRejection {
+    when: ResumeRejected(connection, reason)
+    requires: reason = ConflictLiteral
+    requires: connection.status = reconnecting
+    requires: connection.reconnect_attempts > 0
+    requires: connection.conflict_rejections < config.max_conflict_rejections
+    ensures: connection.conflict_rejections = connection.conflict_rejections + 1
+}
+
+-- The transient auth-timeout rejection (a server event-loop stall or a
+-- retryable database failure during the handshake) is tolerated up to its
+-- own, larger bound. Every other error frame stays fatal by default, so
+-- capacity refusals ('realm is full') are never hammered by auto-retry.
+rule TolerateTransientTimeoutRejection {
+    when: ResumeRejected(connection, reason)
+    requires: reason = TimeoutLiteral
+    requires: connection.status = reconnecting
+    requires: connection.reconnect_attempts > 0
+    requires: connection.timeout_rejections < config.max_timeout_rejections
+    ensures: connection.timeout_rejections = connection.timeout_rejections + 1
+}
+
+-- Any other server error frame (kick, moderation, takeover, failed auth) ends
+-- the session for good: no auto-reconnect, no further retry.
+rule FatalErrorEndsSession {
+    when: ServerErrorFrame(connection, reason)
+    requires: connection.status = connected or connection.status = connecting or connection.status = reconnecting
+    requires: reason != ConflictLiteral
+    requires: reason != TimeoutLiteral
+    ensures: connection.status = disconnected
+    ensures: ClientDisconnected(connection, reason = reason)
+}
+
+-- The post-reconnect hello re-binds the mirror: input acking resets, the
+-- transient rejection counters reset, and the next snapshot rebuilds the world
+-- from an empty interest set. A fresh join (past grace) reads as a hello too.
+rule ReconcileOnHello {
+    when: HelloReceived(connection)
+    requires: connection.status = reconnecting
+    requires: connection.reconnect_attempts > 0
+    ensures: connection.status = connected
+    ensures: connection.reconnect_attempts = 0
+    ensures: connection.conflict_rejections = 0
+    ensures: connection.timeout_rejections = 0
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- THE load-bearing invariant of this boundary. The client never decides a
+-- gameplay outcome: no combat, loot, quest credit, economy, or talent state
+-- originates on the client. It streams intent and commands; it reflects
+-- snapshots. The only sanctioned optimism is trivial UI nudges (a target id,
+-- a pending quest command), never the outcome itself.
+invariant ClientNeverDecidesOutcome {
+    for m in ClientWorldMirror:
+        m.seen_self = true implies SnapshotAuthoritative(m)
+}
+
+-- Every field of every command is type- and shape-checked before any sim
+-- method runs. A malformed command is dropped, never partially applied.
+invariant EveryCommandFieldValidated {
+    for cmd in PlayerCommand where cmd.status = resolved:
+        cmd.fields_validated = true
+}
+
+-- Gameplay outcomes resolve only inside the sim. The server loop is a courier,
+-- never a resolver: it does not compute damage, drops, gold, or XP itself.
+invariant OutcomesResolveOnlyInSim {
+    for cmd in PlayerCommand where cmd.status = resolved:
+        cmd.ok = SimResolved(cmd)
+}
+
+-- A broadcast snapshot reaches a session with only entities inside its
+-- interest shell (plus ids held over unchanged in keep). Entities outside the
+-- shell never appear in ents.
+invariant SnapshotIsInterestScoped {
+    for s in WorldSnapshot:
+        for e in s.ents:
+            e.id in InterestShellIds(s.session)
+}
+
+-- The linkdead grace is bounded: a session held linkdead at this moment is at
+-- most linkdead_grace_ms past when its grace began.
+invariant LinkdeadGraceIsBounded {
+    for s in GameSession where s.status = linkdead:
+        s.grace_until <= now + config.linkdead_grace_ms
+}
+
+-- A resume never re-acquires the character load lease. The original session's
+-- lease still holds; the resume rebinds a socket onto the held session.
+invariant ResumeNeverReacquiresLease {
+    for s in GameSession where s.status = active:
+        ResumeDidNotAcquireLease(s)
+}
+
+-- The per-account cap on live sessions holds: at most
+-- max_active_sessions_per_account non-linkdead sessions per account (GMs
+-- exempt). A different-character login displaces the account's linkdead
+-- sessions immediately rather than at the end of their grace.
+invariant PerAccountSessionCap {
+    for p in Player:
+        GameSession.where(player = p and status = active).count <= config.max_active_sessions_per_account
+}
+
+-- Reconnect uses full-jitter exponential backoff clamped at the max. A fleet
+-- dropped by one server blip never retries on the same beat.
+invariant ReconnectBackoffIsJittered {
+    for c in ClientConnection where c.status = reconnecting:
+        c.next_retry_at <= now + config.reconnect_max_delay_ms
+}
+
+-- Reconnect retries are bounded. Past reconnect_max_attempts (or a fatal
+-- error frame), the connection is disconnected for good; there is no infinite
+-- loop.
+invariant ReconnectRetriesBounded {
+    for c in ClientConnection:
+        c.reconnect_attempts <= config.reconnect_max_attempts
+}
+
+-- The two transient rejection classes each have their own bound. A genuinely
+-- held live session (an explicit takeover) or a persistently failing handshake
+-- eventually ends fatal rather than retrying forever.
+invariant TransientRejectionsBounded {
+    for c in ClientConnection:
+        c.conflict_rejections <= config.max_conflict_rejections and c.timeout_rejections <= config.max_timeout_rejections
+}
+
+-- A forced disconnect (moderation, takeover, anti-bot, account lock) never
+-- enters linkdead grace; it tears down through the leaving state directly, so
+-- no kicked player can be re-kicked or re-connected mid-teardown.
+invariant ForcedDisconnectSkipsGrace {
+    for s in GameSession where s.status = leaving:
+        ForcedPathEntered(s) implies s.grace_until = 0
+}
+
+-- A resolved command carries exactly one correlated outcome, so the client can
+-- match pending sends to server acknowledgements without ambiguity.
+invariant CommandOutcomeCorrelated {
+    for cmd in PlayerCommand where cmd.status = resolved:
+        CommandOutcome.where(rid = cmd.rid and session = cmd.session).count = 1
+}

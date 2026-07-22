@@ -1,0 +1,800 @@
+-- allium: 3
+-- social-guilds-party.allium
+-- Scope: persistent social systems (friends, blocks, ignores, guilds with ranks and calendar) plus the ephemeral party/raid group machine, party-based kill/quest credit-sharing, and the in-game mail system with item escrow.
+-- Includes: Friendship (one-directional, classic auto-add), Block (with friendship suppression and social-delivery gating), Ignore (chat-only), Guild + GuildMember ranks/permissions, GuildInvite, GuildEvent calendar, Party/raid group lifecycle, PartyInvite, group assist (party kill and quest credit shared within range), Mail with attachment escrow, delivery delay, and expiry.
+-- Excludes: chat routing and channels (separate concern), trade and duels (ephemeral mini-systems), PvP arena and rated play (pvp spec), guild bank internals and personal bank (economy spec), quest objective logic beyond party credit-sharing (quests spec), presence/roster UI and wire serialization, deeds stat writes other than the founding/joining hooks.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Vec3 {
+  x: Integer,
+  y: Integer,
+  z: Integer
+}
+
+------------------------------------------------------------
+-- Config (realm tunables the code encodes as named constants)
+------------------------------------------------------------
+
+config {
+  friend_limit: Integer = 50,
+  block_limit: Integer = 50,
+  ignore_limit: Integer = 50,
+  guild_member_limit: Integer = 100,
+  guild_invite_ttl: Duration = 60.seconds,
+  guild_name_min: Integer = 3,
+  guild_name_max: Integer = 24,
+  guild_event_limit: Integer = 25,
+  guild_event_horizon_days: Integer = 366,
+  guild_event_title_max: Integer = 48,
+  guild_event_note_max: Integer = 160,
+  party_max: Integer = 5,
+  raid_min: Integer = 5,
+  raid_max: Integer = 10,
+  raid_group_max: Integer = 5,
+  party_invite_ttl: Duration = 30.seconds,
+  party_xp_range: Integer = 80,
+  mail_postage: Integer = 30,
+  mail_max_attachments: Integer = 3,
+  mail_delivery_seconds: Duration = 45.seconds,
+  mail_expiry_seconds: Duration = 14.days,
+  mail_max_per_recipient: Integer = 100,
+  mail_subject_max: Integer = 64,
+  mail_body_max: Integer = 600
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum GuildRank {
+  leader
+  | officer
+  | member
+}
+
+enum MailKind {
+  player
+  | system
+  | npc
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A character is the social subject: keyed by a stable identity that survives
+-- logout, carrying the purse and the online presence fields a roster row needs.
+entity Character {
+  id: Integer,
+  name: String,
+  level: Integer,
+  realm: String,
+  copper: Integer,
+  online: Boolean,
+  zone: String,
+  dead: Boolean,
+  -- Position used only for the proximity gates (mailbox, party-credit range).
+  pos: Vec3
+}
+
+-- Friendship is deliberately one-directional (classic style): putting a target
+-- on your list needs no acceptance. Each character may hold at most friend_limit.
+entity Friendship {
+  actor: Character,
+  target: Character
+}
+
+-- A heavy social suppression: blocks drop the friend edge, hide the blocker
+-- from /who, and silently swallow mail, whispers, invites, and guild chat from
+-- the blocked character toward the blocker.
+entity Block {
+  actor: Character,
+  target: Character
+}
+
+-- A lighter, chat-only hide: an ignored friend stays a friend (ignoring a
+-- chatty friend is normal), only their public chat stops reaching the ignorer.
+entity Ignore {
+  actor: Character,
+  target: Character
+}
+
+-- A guild. Names are globally unique. A character belongs to at most one.
+entity Guild {
+  name: String,
+  founded_at: Timestamp
+}
+
+-- Membership is the rank-bearing edge. rank drives every permission gate.
+-- last_login is the only soft field the roster shows beyond rank and presence.
+entity GuildMember {
+  character: Character,
+  guild: Guild,
+  rank: GuildRank,
+  last_login: Timestamp,
+
+  is_leader: rank = leader,
+  is_officer: rank = officer
+}
+
+-- A pending guild invite. Single-use: accept, decline, expiry, or a replacement
+-- invite all remove it. Lives only in server memory (never persisted).
+entity GuildInvite {
+  target: Character,
+  guild: Guild,
+  inviter: Character,
+  expires_at: Timestamp
+}
+
+-- One row on the guild calendar. day is a UTC 'YYYY-MM-DD'; null hour is all-day.
+entity GuildEvent {
+  id: Integer,
+  guild: Guild,
+  day: String,
+  hour: Integer,
+  title: String,
+  note: String,
+  created_by: Character
+}
+
+-- A party or raid group (raid is a 5-player party converted into two 5-player
+-- subgroups). Ephemeral: lives only in the sim, torn down on disband.
+entity Party {
+  id: Integer,
+  leader: Character,
+  is_raid: Boolean
+}
+
+-- The membership edge. raid_group (1 or 2) is meaningful only when is_raid.
+entity PartyMember {
+  character: Character,
+  party: Party,
+  raid_group: Integer
+}
+
+-- A pending party/trade/duel invitation shares one "has pending social invite"
+-- slot per target so a character can only be courted by one channel at a time.
+entity PartyInvite {
+  target: Character,
+  inviter: Character,
+  expires_at: Timestamp
+}
+
+-- A letter in the post. Coins and parcels are escrowed out of the sender at
+-- send time. deliver_at is the raven's flight; expires_at is paused (null) while
+-- any attachment remains, then starts the 14-day clock once emptied.
+entity Mail {
+  id: Integer,
+  recipient: Character,
+  sender_name: String,
+  kind: MailKind,
+  subject: String,
+  body: String,
+  copper: Integer,
+  deliver_at: Timestamp,
+  expires_at: Timestamp,
+  read: Boolean,
+  status: in_flight | delivered,
+
+  transitions status { in_flight -> delivered, terminal: delivered },
+
+  has_attachments: copper > 0 or Count(MailAttachment{mail: this}) > 0,
+  is_expiring: expires_at <= now and not (copper > 0 or Count(MailAttachment{mail: this}) > 0)
+}
+
+-- One item stack riding with a letter. Soulbound and quest items are refused
+-- at send time, so any attachment here is plain, fungible stock.
+entity MailAttachment {
+  mail: Mail,
+  item_id: String,
+  count: Integer
+}
+
+------------------------------------------------------------
+-- Friends
+------------------------------------------------------------
+
+-- Classic one-directional befriend: no acceptance step, the target is simply
+-- added to the actor's list. Refused while a block is in effect, so a player
+-- can never end up both blocking and friending the same character.
+rule AddFriend {
+  when: AddFriend(actor, target_name)
+  let target = Character{name: target_name}
+  requires: target != null
+  requires: target != actor
+  requires: not exists Block{actor: actor, target: target}
+  requires: not exists Friendship{actor: actor, target: target}
+  requires: Count(Friendship{actor: actor}) < config.friend_limit
+
+  ensures: Friendship.created(actor, target)
+}
+
+-- Removing a friend only drops the actor's outgoing edge; the reverse edge,
+-- if any, is the other character's to keep.
+rule RemoveFriend {
+  when: RemoveFriend(actor, target_name)
+  let target = Character{name: target_name}
+  let edge = Friendship{actor: actor, target: target}
+  requires: edge != null
+
+  ensures: not exists edge
+}
+
+------------------------------------------------------------
+-- Blocks and ignores
+------------------------------------------------------------
+
+-- A block is the heavy tool: it also evicts the target from the actor's friend
+-- list, so the two can never coexist. The eviction runs in the same rule.
+rule AddBlock {
+  when: AddBlock(actor, target_name)
+  let target = Character{name: target_name}
+  requires: target != null
+  requires: target != actor
+  requires: not exists Block{actor: actor, target: target}
+  requires: Count(Block{actor: actor}) < config.block_limit
+  let friend_edge = Friendship{actor: actor, target: target}
+
+  ensures: Block.created(actor, target)
+  ensures: not exists friend_edge
+}
+
+rule RemoveBlock {
+  when: RemoveBlock(actor, target_name)
+  let target = Character{name: target_name}
+  let edge = Block{actor: actor, target: target}
+  requires: edge != null
+
+  ensures: not exists edge
+}
+
+-- An ignore never touches the friend list: ignoring a chatty friend is a normal
+-- player preference, distinct from blocking them.
+rule AddIgnore {
+  when: AddIgnore(actor, target_name)
+  let target = Character{name: target_name}
+  requires: target != null
+  requires: target != actor
+  requires: not exists Ignore{actor: actor, target: target}
+  requires: Count(Ignore{actor: actor}) < config.ignore_limit
+
+  ensures: Ignore.created(actor, target)
+}
+
+rule RemoveIgnore {
+  when: RemoveIgnore(actor, target_name)
+  let target = Character{name: target_name}
+  let edge = Ignore{actor: actor, target: target}
+  requires: edge != null
+
+  ensures: not exists edge
+}
+
+------------------------------------------------------------
+-- Guilds: founding, membership, ranks
+------------------------------------------------------------
+
+-- Founding seats the leader in the same atomic step as the guild row, so a
+-- racing or duplicate create packet can never orphan a leaderless guild. The
+-- name rules (3-24 letters, single interior spaces) keep the roster header tidy.
+rule FoundGuild {
+  when: FoundGuild(actor, raw_name)
+  let name = ValidateGuildName(raw_name)
+  requires: name != null
+  requires: not exists GuildMember{character: actor}
+  requires: not exists Guild{name: name}
+
+  ensures: Guild.created(name, now)
+  ensures: GuildMember.created(actor, Guild{name: name}, leader, now)
+  ensures: GuildFounded(actor)
+}
+
+-- Only officers and the leader may invite. The target must be online and guild-
+-- less, and the guild must be under cap. A target who has the inviter on their
+-- block list never sees the invite: from the inviter's side it looks like a
+-- silent decline, and no pending state is created.
+rule InviteGuildMember {
+  when: InviteGuildMember(inviter, target_name)
+  let inviter_member = GuildMember{character: inviter}
+  requires: inviter_member != null
+  requires: inviter_member.is_officer or inviter_member.is_leader
+  let target = Character{name: target_name}
+  requires: target != null
+  requires: target.online
+  requires: target != inviter
+  requires: not exists GuildMember{character: target}
+  requires: not exists GuildInvite{target: target}
+  requires: Count(GuildMember{guild: inviter_member.guild}) < config.guild_member_limit
+  requires: not exists Block{actor: target, target: inviter}
+
+  ensures: GuildInvite.created(target, inviter_member.guild, inviter, now + config.guild_invite_ttl)
+  ensures: GuildInviteDelivered(target, inviter_member.guild)
+}
+
+-- A pending invite lapses after its TTL; the slot frees for another guild.
+rule GuildInviteExpires {
+  when: invite: GuildInvite.expires_at <= now
+
+  ensures: not exists invite
+}
+
+-- Accept re-checks the member cap atomically: a guild that filled while the
+-- invite was in flight is refused, never over-admitted. The accepter must still
+-- be guild-less (a stale invite cannot drop them into a second guild).
+rule AcceptGuildInvite {
+  when: AcceptGuildInvite(actor)
+  let invite = GuildInvite{target: actor}
+  requires: invite != null
+  requires: invite.expires_at > now
+  requires: not exists GuildMember{character: actor}
+  requires: Count(GuildMember{guild: invite.guild}) < config.guild_member_limit
+
+  ensures: GuildMember.created(actor, invite.guild, member, now)
+  ensures: not exists invite
+  ensures: GuildJoined(actor, invite.guild)
+}
+
+rule DeclineGuildInvite {
+  when: DeclineGuildInvite(actor)
+  let invite = GuildInvite{target: actor}
+
+  ensures: not exists invite
+}
+
+-- The leader cannot simply leave while others remain: they must hand leadership
+-- over or disband, so a populated guild is never left leaderless. The last
+-- member out dissolves the guild entirely.
+rule LeaveGuild {
+  when: LeaveGuild(actor)
+  let member = GuildMember{character: actor}
+  requires: member != null
+  let others = OtherMembers(member.guild, actor)
+  requires: not (member.is_leader and Count(others) > 0)
+
+  ensures: not exists member
+  if Count(others) = 0:
+    ensures: not exists member.guild
+}
+
+-- Disband dissolves the guild and every membership edge in one step. Leader only.
+rule DisbandGuild {
+  when: DisbandGuild(actor)
+  let member = GuildMember{character: actor}
+  requires: member != null
+  requires: member.is_leader
+  let guild = member.guild
+
+  for m in GuildMembers:
+    if m.guild = guild:
+      ensures: not exists m
+  ensures: not exists guild
+}
+
+-- Rank-gated kick: officers can remove ordinary members, but only the leader
+-- can remove an officer, and no one removes the leader (use transfer first).
+rule KickGuildMember {
+  when: KickGuildMember(actor, target_name)
+  let actor_member = GuildMember{character: actor}
+  requires: actor_member != null
+  requires: actor_member.is_officer or actor_member.is_leader
+  let target = Character{name: target_name}
+  let target_member = GuildMember{character: target, guild: actor_member.guild}
+  requires: target_member != null
+  requires: target != actor
+  requires: not target_member.is_leader
+  requires: actor_member.is_leader or not target_member.is_officer
+
+  ensures: not exists target_member
+}
+
+-- Leader-only rank change. The leader rank itself is unreachable here: handing
+-- over leadership must go through TransferGuildLeadership so the singleton
+-- leader invariant is preserved.
+rule SetGuildMemberRank {
+  when: SetGuildMemberRank(actor, target_name, new_rank)
+  let actor_member = GuildMember{character: actor}
+  requires: actor_member != null
+  requires: actor_member.is_leader
+  requires: new_rank != leader
+  let target = Character{name: target_name}
+  let target_member = GuildMember{character: target, guild: actor_member.guild}
+  requires: target_member != null
+  requires: target != actor
+  requires: target_member.rank != new_rank
+
+  ensures: target_member.rank = new_rank
+}
+
+-- Leadership handoff: the new leader is promoted and the old leader steps down
+-- to officer in the same step, so the guild always has exactly one leader.
+rule TransferGuildLeadership {
+  when: TransferGuildLeadership(actor, target_name)
+  let actor_member = GuildMember{character: actor}
+  requires: actor_member != null
+  requires: actor_member.is_leader
+  let target = Character{name: target_name}
+  let target_member = GuildMember{character: target, guild: actor_member.guild}
+  requires: target_member != null
+  requires: target != actor
+
+  ensures: target_member.rank = leader
+  ensures: actor_member.rank = officer
+}
+
+------------------------------------------------------------
+-- Guild calendar
+------------------------------------------------------------
+
+-- Officers and the leader book events. A long-past prune runs alongside the
+-- booking, and the upcoming-events cap bounds the visible window. A day must
+-- be a real UTC date within the horizon (not before yesterday).
+rule CreateGuildEvent {
+  when: CreateGuildEvent(actor, day, hour, title, note)
+  let member = GuildMember{character: actor}
+  requires: member != null
+  requires: member.is_officer or member.is_leader
+  let valid_day = ValidateGuildEventDay(day, Today())
+  requires: valid_day != null
+  let clean_title = Clip(title, config.guild_event_title_max)
+  let clean_note = Clip(note, config.guild_event_note_max)
+  requires: Length(clean_title) > 0
+  requires: Count(GuildEvent{guild: member.guild}) < config.guild_event_limit
+
+  ensures: GuildEvent.created(member.guild, valid_day, hour, clean_title, clean_note, actor)
+}
+
+rule RemoveGuildEvent {
+  when: RemoveGuildEvent(actor, event_id)
+  let member = GuildMember{character: actor}
+  requires: member != null
+  requires: member.is_officer or member.is_leader
+  let event = GuildEvent{id: event_id, guild: member.guild}
+  requires: event != null
+
+  ensures: not exists event
+}
+
+------------------------------------------------------------
+-- Party / raid group
+------------------------------------------------------------
+
+-- The inviter must be the leader (if a party already exists), the party must
+-- be under cap, the target must be party-less, and the target must have no
+-- pending social invite of any kind (party/trade/duel share one slot).
+rule InvitePartyMember {
+  when: InvitePartyMember(inviter, target)
+  let inviter_party = PartyOf(inviter)
+  requires: inviter_party = null or PartyLeader(inviter_party) = inviter
+  requires: PartyCapacity(inviter_party) > PartySize(inviter_party)
+  requires: PartyOf(target) = null
+  requires: target != inviter
+  requires: not HasPendingSocialInvite(target)
+
+  ensures: PartyInvite.created(target, inviter, now + config.party_invite_ttl)
+}
+
+-- A stale incoming invite is refused if the accepter has since joined or formed
+-- another party: the "at most one party" invariant is re-checked at accept.
+-- Forming the party on first accept credits BOTH the inviter and the accepter
+-- with a join, mirroring party formation as the inviter's join too.
+rule AcceptPartyInvite {
+  when: AcceptPartyInvite(actor)
+  let invite = PartyInvite{target: actor}
+  requires: invite != null
+  requires: invite.expires_at > now
+  requires: PartyOf(actor) = null
+  let party = PartyOf(invite.inviter)
+  requires: party = null or PartyCapacity(party) > PartySize(party)
+  let target_party = if party = null: NewPartyFor(invite.inviter) else: party
+
+  ensures: PartyMember.created(actor, target_party, NextRaidGroup(target_party))
+  ensures: not exists invite
+  ensures: PartyJoined(actor)
+  if party = null:
+    ensures: PartyMember.created(invite.inviter, target_party, 1)
+    ensures: PartyJoined(invite.inviter)
+}
+
+rule DeclinePartyInvite {
+  when: DeclinePartyInvite(actor)
+  let invite = PartyInvite{target: actor}
+
+  ensures: not exists invite
+}
+
+-- Leaving reassigns leadership if the leaver was the leader, and disbands the
+-- party outright once only one (or zero) members remain.
+rule LeaveParty {
+  when: LeaveParty(actor)
+  let member = PartyMember{character: actor}
+  requires: member != null
+  let party = member.party
+  let remaining = OtherPartyMembers(party, actor)
+
+  ensures: not exists member
+  if Count(remaining) > 0:
+    if PartyLeader(party) = actor:
+      ensures: party.leader = FirstOf(remaining)
+  else:
+    ensures: not exists party
+}
+
+rule KickPartyMember {
+  when: KickPartyMember(actor, target)
+  let member = PartyMember{character: actor}
+  let party = member.party
+  requires: PartyLeader(party) = actor
+  let target_member = PartyMember{character: target, party: party}
+  requires: target_member != null
+  requires: target != actor
+
+  ensures: not exists target_member
+}
+
+-- Leadership handoff within a party: roster unchanged, only the leader field
+-- moves. Loot settings pinned to the leader follow automatically.
+rule PromotePartyLeader {
+  when: PromotePartyLeader(actor, target)
+  let member = PartyMember{character: actor}
+  let party = member.party
+  requires: PartyLeader(party) = actor
+  let target_member = PartyMember{character: target, party: party}
+  requires: target_member != null
+  requires: target != actor
+
+  ensures: party.leader = target
+}
+
+-- A full 5-player party may convert to a raid (two 5-player subgroups).
+rule ConvertPartyToRaid {
+  when: ConvertPartyToRaid(actor)
+  let member = PartyMember{character: actor}
+  let party = member.party
+  requires: party != null
+  requires: PartyLeader(party) = actor
+  requires: not party.is_raid
+  requires: PartySize(party) >= config.raid_min
+
+  ensures: party.is_raid = true
+}
+
+-- A raid with five or fewer members may fold back to a single party.
+rule ConvertRaidToParty {
+  when: ConvertRaidToParty(actor)
+  let member = PartyMember{character: actor}
+  let party = member.party
+  requires: party != null
+  requires: PartyLeader(party) = actor
+  requires: party.is_raid
+  requires: PartySize(party) <= config.party_max
+
+  ensures: party.is_raid = false
+}
+
+------------------------------------------------------------
+-- Group assist: party-based kill and quest credit-sharing
+------------------------------------------------------------
+
+-- The classic group rule: when a mob dies, kill credit, XP, and quest progress
+-- are shared with every party member within party_xp_range of the corpse. A
+-- group XP bonus rewards larger parties; the base XP is split evenly across
+-- the eligible members, so a member always gets more solo but a group always
+-- clears faster. A downed member's corpse position still counts, so releasing
+-- to the graveyard during the final seconds does not erase credit. With no
+-- party, credit and XP go to the tapper (or killer) alone.
+rule ShareKillCreditWithinParty {
+  when: MobSlain(mob, killer, tapper)
+  let credited = if PartyOf(tapper) != null: tapper else: killer
+  let party = PartyOf(credited)
+  let eligible = EligibleMembers(party, mob, config.party_xp_range, credited)
+  let bonus = GroupXpBonus(Count(eligible))
+  let per_member_xp = Round(MobXpValue(mob) * bonus / Count(eligible))
+
+  for member in eligible:
+    ensures: XpGranted(member, per_member_xp)
+    ensures: QuestKillCredit(member, mob)
+  ensures: SetLootRecipients(mob, eligible)
+}
+
+------------------------------------------------------------
+-- Mail
+------------------------------------------------------------
+
+-- Player mail escrows coin and parcels out of the sender at send time, charges
+-- postage on top, and books the letter onto the raven for a fixed flight. The
+-- recipient's mailbox cap bounds incoming spam. Attachments pause the expiry
+-- clock: a letter carrying goods gets expires_at = null until they are taken.
+rule SendPlayerMail {
+  when: SendPlayerMail(sender, recipient, subject, body, copper, parcels)
+  requires: not sender.dead
+  requires: WithinRange(sender.pos, NearestMailbox(sender), MailboxRange())
+  requires: Length(subject) <= config.mail_subject_max
+  requires: Length(body) <= config.mail_body_max
+  requires: Count(parcels) <= config.mail_max_attachments
+  requires: not AnySoulbound(parcels)
+  requires: not AnyQuestItem(parcels)
+  requires: HasFungibleStock(sender, parcels)
+  requires: sender.copper >= copper + config.mail_postage
+  requires: Count(Mail{recipient: recipient}) < config.mail_max_per_recipient
+  let has_attachments = copper > 0 or Count(parcels) > 0
+
+  ensures: sender.copper = sender.copper - copper - config.mail_postage
+  ensures: RemoveFungibleStock(sender, parcels)
+  ensures: Mail.created(
+    recipient = recipient,
+    sender_name = sender.name,
+    kind = player,
+    subject = Clip(subject, config.mail_subject_max),
+    body = Clip(body, config.mail_body_max),
+    copper = copper,
+    deliver_at = now + config.mail_delivery_seconds,
+    expires_at = now + config.mail_expiry_seconds,
+    read = false,
+    status: in_flight)
+  for p in parcels:
+    ensures: MailAttachment.created(Mail{recipient: recipient, deliver_at: now + config.mail_delivery_seconds}, p.item_id, p.count)
+  ensures: MailSent(sender, recipient, config.mail_postage)
+}
+
+-- The raven lands: an in-flight letter becomes delivered at its deliver_at.
+-- The arrival is what the recipient's unread index counts against.
+rule MailDelivered {
+  when: m: Mail.deliver_at <= now
+  requires: m.status = in_flight
+
+  ensures: m.status = delivered
+  ensures: MailArrived(m.recipient, m.sender_name)
+}
+
+-- Coin is always taken (the purse has no cap); parcels respect bag capacity,
+-- so a stack that does not fit stays attached for a later take. Only when the
+-- last attachment leaves does the expiry clock start, if it never had one.
+rule TakeMailAttachments {
+  when: TakeMailAttachments(actor, mail_id)
+  requires: not actor.dead
+  requires: WithinRange(actor.pos, NearestMailbox(actor), MailboxRange())
+  let m = Mail{id: mail_id, recipient: actor}
+  requires: m != null
+  requires: m.status = delivered
+  let still_attached = UnfitAttachments(actor, m)
+
+  ensures: actor.copper = actor.copper + m.copper
+  ensures: m.copper = 0
+  for a in MailAttachment{mail: m}:
+    if FitsInBags(actor, a):
+      ensures: GrantItem(actor, a.item_id, a.count)
+      ensures: not exists a
+  ensures: m.read = true
+  if Count(still_attached) = 0:
+    ensures: m.expires_at = now + config.mail_expiry_seconds
+}
+
+rule MarkMailRead {
+  when: MarkMailRead(actor, mail_id)
+  let m = Mail{id: mail_id, recipient: actor}
+  requires: m != null
+
+  ensures: m.read = true
+}
+
+-- A letter with no remaining attachments expires after its window. A letter
+-- still carrying coin or parcels can never expire: the sender's escrow must
+-- stay recoverable, so is_expiring is held false until the last attachment
+-- is taken (which also resets the clock to a fresh window).
+rule MailExpires {
+  when: m: Mail.is_expiring transitions_to true
+
+  ensures: not exists m
+}
+
+-- A letter cannot be deleted while it still holds attachments: the parcels must
+-- be taken first, so escrowed goods are never silently destroyed.
+rule DeleteMail {
+  when: DeleteMail(actor, mail_id)
+  let m = Mail{id: mail_id, recipient: actor}
+  requires: m != null
+  requires: m.status = delivered
+  requires: not m.has_attachments
+
+  ensures: not exists m
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant CharacterInAtMostOneGuild {
+  for c in Characters:
+    Count(GuildMember{character: c}) <= 1
+}
+
+invariant CharacterInAtMostOneParty {
+  for c in Characters:
+    Count(PartyMember{character: c}) <= 1
+}
+
+invariant GuildHasExactlyOneLeader {
+  for g in Guilds:
+    Count(GuildMember{guild: g, rank: leader}) = 1
+}
+
+invariant PartyHasAtLeastOneMember {
+  for p in Parties:
+    PartySize(p) >= 1
+}
+
+invariant PartySizeWithinCapacity {
+  for p in Parties:
+    (not p.is_raid implies PartySize(p) <= config.party_max)
+    and (p.is_raid implies PartySize(p) <= config.raid_max)
+}
+
+invariant RaidGroupWithinSubgroupCap {
+  -- A raid's two subgroups each cap at raid_group_max (5): the party conversion
+  -- rule normalizes the split, and moves between groups honour the cap.
+  for p in Parties:
+    p.is_raid implies Count(PartyMember{party: p, raid_group: 1}) <= config.raid_group_max
+    and Count(PartyMember{party: p, raid_group: 2}) <= config.raid_group_max
+}
+
+invariant GuildSizeWithinMemberCap {
+  for g in Guilds:
+    Count(GuildMember{guild: g}) <= config.guild_member_limit
+}
+
+invariant FriendshipAndBlockMutuallyExclusive {
+  -- A block always evicts the friend edge, so no character can both friend and
+  -- block the same target.
+  for c in Characters:
+    for f in Friendship{actor: c}:
+      not exists Block{actor: c, target: f.target}
+}
+
+invariant IgnoreNeverEvictsFriendship {
+  -- An ignore never drops a friendship (only a block does), so an ignored
+  -- friend stays a friend. The AddIgnore rule has no edge-removal effect,
+  -- unlike AddBlock which carries the friend eviction.
+  for ig in Ignores:
+    not AddIgnoreRemoved(ig.actor, ig.target)
+}
+
+invariant FriendListBounded {
+  for c in Characters:
+    Count(Friendship{actor: c}) <= config.friend_limit
+}
+
+invariant BlockListBounded {
+  for c in Characters:
+    Count(Block{actor: c}) <= config.block_limit
+}
+
+invariant IgnoreListBounded {
+  for c in Characters:
+    Count(Ignore{actor: c}) <= config.ignore_limit
+}
+
+invariant MailboxBounded {
+  for c in Characters:
+    Count(Mail{recipient: c}) <= config.mail_max_per_recipient
+}
+
+invariant MailAttachmentsPauseExpiry {
+  -- A letter carrying coin or parcels is never up for expiry: its is_expiring
+  -- flag is held false by has_attachments, so escrow is never silently lost.
+  for m in Mails:
+    m.has_attachments implies not m.is_expiring
+}
+
+invariant BlockSuppressesGuildInviteVisibility {
+  -- A guild invite is never created when the target is blocking the inviter:
+  -- the block silently swallows the offer rather than surfacing it.
+  for i in GuildInvites:
+    not exists Block{actor: i.target, target: i.inviter}
+}
+
+open question "Should mail forwarding/return-to-sender on expiry of an attachments-carrying letter be modelled here, or in the economy spec that owns escrow semantics?"
+open question "The party-credit rule uses a participation position (corpse pos for a released member) so a downed member still gets credit; is that a domain rule or an implementation detail of the proximity check?"
+open question "Friendship is one-directional with no accept step in the actual code (classic style); the brief's 'send/accept/decline' vocabulary does not map onto it. Accept this as the modelled behaviour, or introduce a two-step request flow the code does not have?"

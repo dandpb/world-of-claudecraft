@@ -1,0 +1,511 @@
+-- allium: 3
+-- deeds-achievements.allium
+-- Scope: the Book of Deeds achievement system, its cosmetic-only reward contract, the deterministic evaluator pipeline, Renown as a cosmetic progression currency, and the account-scoped Renown board.
+-- Includes: the deed catalog as data-as-code (sampled, not exhaustive); the closed trigger vocabulary; the idempotent completion record; per-character deed state and the title selection; Renown award and the load-time recompute; the no-permanently-missable fallback grants; the board's scoring set, entry floor, and score-then-earliest tie-break; the cosmetic-only, append-only, luck-free, zero-rng, single-completion-predicate, and ranked-surface invariants.
+-- Excludes: the full enumeration of every deed's content (sampled, not repeated); the SQL/persistence shape of character_deeds (modelled as records, not schema); the Steam mirror and the guild/friend broadcast fan-out (observer-only surfaces); the rarity denominator and percentile readouts; wiki generation and the spoiler-safe stripping; i18n and the HUD window; the server-side FIFO, TTL cache, and demand-gate machinery; the HTTP leaderboard pipeline; the per-attempt encounter runtime internals (modelled only by its observable grant outputs).
+
+------------------------------------------------------------
+-- Config (the Renown scale and the board floor)
+------------------------------------------------------------
+
+config {
+  renown_routine: Integer = 5,
+  renown_standard: Integer = 10,
+  renown_notable: Integer = 25,
+  renown_prestige: Integer = 50,
+  renown_zero: Integer = 0,
+  board_entry_floor: Integer = 50,
+  tick_rate: Integer = 20,
+  dirty_sweep_period_ticks: Integer = 20
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The Renown quantization. The catalog carries only these five values.
+enum RenownBand {
+    zero
+    | routine
+    | standard
+    | notable
+    | prestige
+}
+
+-- The closed trigger vocabulary. A new kind is a conscious design act;
+-- authoring lands as a new deed over an existing kind where one fits.
+enum TriggerKind {
+    level
+    | lifetime_xp
+    | quest
+    | stat
+    | dungeon_clears
+    | delve_clears
+    | arena_rating
+    | craft_skill
+    | gathering
+    | collect_items
+    | visit
+    | meta
+    | meter
+    | flag
+    | manual
+}
+
+enum RewardKind {
+    title
+    | border
+}
+
+------------------------------------------------------------
+-- Value types
+------------------------------------------------------------
+
+-- A deed's satisfaction condition. The evaluator reads only the persisted
+-- state the kind names; the manual kind is granted only by an explicit call
+-- at a bespoke sim site and is never satisfied by the generic evaluator.
+value DeedTrigger {
+    kind: TriggerKind,
+    -- A numeric threshold for the threshold-shaped kinds (level, lifetime_xp,
+    -- stat, dungeon_clears, delve_clears, arena_rating, craft_skill,
+    -- gathering, meter). Unused by the set-membership kinds.
+    threshold: Integer,
+    -- Authored ids the trigger reads: quest ids, item ids, visited marks,
+    -- or (for meta) other deed ids. Bounded and stable.
+    references: Set<String>
+}
+
+value DeedReward {
+    kind: RewardKind,
+    -- The English title text or border slug; localized only at the client.
+    text: String
+}
+
+------------------------------------------------------------
+-- External entities (owned by other specs)
+------------------------------------------------------------
+
+-- The account scope of the Renown board. Several Characters may map to one
+-- Account; the board dedupes once per account.
+entity Account {
+    id: Integer,
+    characters: Set<Character> with account = this
+}
+
+------------------------------------------------------------
+-- Catalog: data-as-code, one record per shipped deed
+------------------------------------------------------------
+
+-- A deed definition. Append-only: once an id has shipped it is frozen for the
+-- lifetime of every save, so the record is never deleted and its trigger is
+-- never retro-edited. New coverage lands as a NEW deed.
+entity Deed {
+    id: String,
+    name: String,
+    category: String,
+    renown: RenownBand,
+    trigger: DeedTrigger,
+    reward: DeedReward?,
+    -- Fully invisible until earned: name, desc, AND existence are stripped
+    -- from every anonymous or third-party public surface.
+    hidden: Boolean,
+    -- The zero-Renown trophy shelf. Feats never count toward the completion
+    -- pair and never score on the Renown board.
+    feat: Boolean
+}
+
+-- The ordered catalogue. DEED_ORDER derives from table order, so the
+-- catalogue is append-only: entries never reorder.
+entity Catalogue {
+    deeds: List<Deed>
+}
+
+------------------------------------------------------------
+-- Per-character deed facet
+------------------------------------------------------------
+
+-- A character's deed state. One deterministic evaluator (the contract below)
+-- is the only path that writes the earned set; the board and the completion
+-- pair are read-only views over it.
+entity Character {
+    account: Account,
+    level: Integer,
+    lifetime_xp: Integer,
+    earned: Set<DeedRecord> with character = this,
+    deed_stats: DeedStats with character = this,
+    -- The displayed title, or null. Validator accepts only an EARNED deed
+    -- whose reward is a title; invalid input is a silent no-op.
+    active_title: Deed?,
+    -- A cosmetic progression currency maintained incrementally on grant.
+    renown: Integer
+}
+
+-- The persisted per-character lifetime counters and mark sets backing
+-- trigger kinds stat, collect_items, visit, and dungeon_clears.
+entity DeedStats {
+    character: Character,
+    counters: Set<StatCounter> with stats = this,
+    items_discovered: Set<String>,
+    visited: Set<String>,
+    dungeon_clears: Set<ClearRecord> with stats = this
+}
+
+entity StatCounter {
+    stats: DeedStats,
+    key: String,
+    value: Integer
+}
+
+entity ClearRecord {
+    stats: DeedStats,
+    dungeon_id: String,
+    difficulty: String,
+    count: Integer
+}
+
+-- The persisted per-character earned record. Idempotent: a replay of the
+-- same (character, deed) pair is a no-op, which is what makes the
+-- fire-and-forget observer and the login reconcile safe.
+entity DeedRecord {
+    character: Character,
+    deed: Deed,
+    -- The host utcDay the deed was earned. The sim stamps it; the board's
+    -- completion-time tie-break reads it.
+    earned_day: String,
+    -- The wall-clock earn instant, used for the board tie-break. Carried
+    -- alongside the utcDay because the day is too coarse to break ties.
+    earned_at: Timestamp
+}
+
+------------------------------------------------------------
+-- The evaluator contract: a deterministic, zero-rng state machine
+------------------------------------------------------------
+
+-- One evaluator decides every non-manual unlock. It runs at the very end of
+-- the tick tail (and once per character on world join with retro = true).
+-- It draws ZERO rng, so its placement cannot fork the shared draw order.
+contract DeedEvaluator {
+    evaluate: (character: Character) -> Set<Deed>
+
+    @invariant EvaluatorDrawsZeroRng
+        -- The evaluator never touches the world's rng stream. Its placement
+        -- in the tick is therefore draw-order-neutral.
+
+    @invariant EvaluatorReachesFixpointInOnePass
+        -- A pass re-checks until nothing new grants, so a meta deed over a
+        -- freshly-granting deed resolves inside the same pass.
+
+    @invariant EvaluatorRespectsManualExclusion
+        -- The generic evaluator never grants a manual deed. The manual kind
+        -- is reached only through the explicit grant site.
+}
+
+------------------------------------------------------------
+-- The Renown board
+------------------------------------------------------------
+
+-- The board ranks accounts over their scoring set. The board SCORES; it does
+-- not COUNT. The scoring set is the distinct renown-bearing deed ids per
+-- account; zero-renown deeds sit outside it by design so luck never moves a
+-- rank.
+entity DeedsBoard {
+    ranked: List<RankedAccount>
+}
+
+entity RankedAccount {
+    board: DeedsBoard,
+    account: Account,
+    -- Sum of renown over the account's scoring set. Points are NEVER stored;
+    -- the catalogue is the single source of truth for renown values.
+    score: Integer,
+    -- When the account's current score was reached: max over the scoring set
+    -- of each deed's EARLIEST earn across the account's characters.
+    completion_time: Timestamp,
+    -- The account's face on the board: its highest-renown character.
+    display_character: Character
+}
+
+------------------------------------------------------------
+-- Rules: completion, renown, title, and the evaluator arm
+------------------------------------------------------------
+
+-- The tick-tail evaluation arm. Re-checks the dirty character's unearned
+-- non-manual deeds and grants whichever hold, looping to a fixpoint so metas
+-- over freshly granted deeds resolve in the same pass. The manual kind is
+-- skipped: it is reached only through RecordManualGrant below.
+rule EvaluateDeedsOnTick {
+    when: TickTail(tick_count)
+    let c = DirtyCharacter()
+    for deed in c.deeds_in_scope:
+        if not AlreadyEarned(c, deed) and SatisfiesTrigger(c, deed):
+            ensures: DeedRecord.created(character = c, deed = deed, earned_day = CurrentUtcDay(), earned_at = now)
+            ensures: c.earned = c.earned + deed
+            ensures: c.renown = c.renown + RenownValue(deed.renown)
+            ensures: DeedUnlocked(c, deed, false)
+}
+
+-- A manual deed is granted only by an explicit call at a bespoke sim site
+-- (an encounter mechanical/perfection/restriction/speed task, a hidden
+-- delight). Same idempotent grant shape as the evaluator arm.
+rule RecordManualGrant {
+    when: ManualGrantSite(c, deed)
+    requires: deed.trigger.kind = manual
+    requires: not AlreadyEarned(c, deed)
+    ensures: DeedRecord.created(character = c, deed = deed, earned_day = CurrentUtcDay(), earned_at = now)
+    ensures: c.earned = c.earned + deed
+    ensures: c.renown = c.renown + RenownValue(deed.renown)
+    ensures: DeedUnlocked(c, deed, false)
+}
+
+-- Idempotency: a replay of the same (character, deed) pair is a no-op. This
+-- is the rule that makes the retro pass, the login reconcile, and the
+-- fire-and-forget observer all safe.
+rule IdempotentReplayIsNoOp {
+    when: ReplayGrant(c, deed)
+    requires: AlreadyEarned(c, deed)
+    ensures: c.earned = c.earned
+    ensures: c.renown = c.renown
+}
+
+-- Title selection. The sole validator both worlds reach. A non-null id is
+-- accepted only when the player has EARNED the deed and its reward is a
+-- title; invalid input is a SILENT no-op (defensive against stale clients).
+rule SelectActiveTitle {
+    when: SetActiveTitle(c, deed)
+    if deed != null:
+        requires: AlreadyEarned(c, deed)
+        requires: deed.reward.kind = title
+        ensures: c.active_title = deed
+    else:
+        ensures: c.active_title = null
+}
+
+-- The world-join arm: a returning veteran's blob is re-evaluated against
+-- live state and grants with retro = true. The earned set is the only
+-- re-check surface, and grants are idempotent, so the pass is safe to repeat
+-- every login.
+rule RetroevaluateOnWorldJoin {
+    when: CharacterJoined(c)
+    requires: c.level > 0
+    for deed in c.deeds_in_scope:
+        if not AlreadyEarned(c, deed) and SatisfiesTrigger(c, deed):
+            ensures: DeedRecord.created(character = c, deed = deed, earned_day = CurrentUtcDay(), earned_at = now)
+            ensures: c.earned = c.earned + deed
+            ensures: c.renown = c.renown + RenownValue(deed.renown)
+            ensures: DeedUnlocked(c, deed, true)
+}
+
+-- The no-permanently-missable rule (rule 5). A deed whose earning window has
+-- passed for THIS character is healed at world join instead of left visible-
+-- but-unearnable. Two shapes: a PROOF inference (persisted state demonstrates
+-- the action happened before its counter existed) and a STRANDED heal (no
+-- earn path can ever exist again for this character).
+rule HealStrandedDeedOnJoin {
+    when: CharacterJoined(c)
+    for deed in c.deeds_in_scope:
+        if not AlreadyEarned(c, deed) and PermanentlyUnreachable(c, deed):
+            ensures: DeedRecord.created(character = c, deed = deed, earned_day = CurrentUtcDay(), earned_at = now)
+            ensures: c.earned = c.earned + deed
+            ensures: c.renown = c.renown + RenownValue(deed.renown)
+            ensures: DeedUnlocked(c, deed, true)
+}
+
+-- The sim is authoritative for renown: it is recomputed from the earned set
+-- on every load. The saved number exists only for a later sort index; a
+-- rebalance needs no migration because the catalogue is the source of truth.
+rule RecomputeRenownOnLoad {
+    when: CharacterLoaded(c)
+    let total = SumOver(c.earned, d => RenownValue(d.deed.renown))
+    ensures: c.renown = total
+}
+
+-- Seed the discovery ledger from what the character already holds (bags,
+-- bank, equipment, vendor buyback), so veterans keep credit for what they
+-- still own. Runs on every join; the set only grows, so re-seeding is
+-- idempotent.
+rule SeedItemDiscoveryOnJoin {
+    when: CharacterJoined(c)
+    for item_id in HeldItems(c):
+        if not (item_id in c.deed_stats.items_discovered):
+            ensures: c.deed_stats.items_discovered = c.deed_stats.items_discovered + item_id
+}
+
+------------------------------------------------------------
+-- Rules: the Renown board
+------------------------------------------------------------
+
+-- The board scores an account over its scoring set: the distinct renown-
+-- bearing deed ids earned by ANY of the account's characters. A deed earned
+-- by two characters of one account scores once; zero-renown deeds score
+-- never and perturb the tie-break never.
+rule ScoreAccountOnRenownBoard {
+    when: BoardRefresh(board)
+    for acct in Accounts():
+        let scoring_set = DistinctRenownBearingDeeds(acct)
+        let score = SumOver(scoring_set, d => RenownValue(d.renown))
+        let completion = MaxOver(scoring_set, d => EarliestEarn(acct, d))
+        if score >= board_entry_floor:
+            ensures: RankedAccount.created(board = board, account = acct, score = score, completion_time = completion, display_character = HighestRenownCharacter(acct))
+}
+
+-- The ordering: score descending, then completion_time ascending (score-
+-- then-earliest), then account id ascending as the final deterministic key.
+-- The ordering itself is pinned by the RankedOrderIsScoreThenEarliest
+-- invariant below; this rule only fires the recompute pass that produces a
+-- fresh ranked list under that ordering.
+rule RankBoardOnRefresh {
+    when: BoardRefresh(board)
+    for acct in Accounts():
+        let prior = RankedAccountOnBoard(board, acct)
+        if prior != null:
+            requires: ScoreThenEarliestIsRespected(board)
+}
+
+------------------------------------------------------------
+-- Invariants: the design contract
+------------------------------------------------------------
+
+-- COSMETIC ONLY. The load-bearing design rule. A deed, its reward, and every
+-- ranked surface may confer only cosmetic effects: titles, borders, and
+-- Renown. Never stats, never abilities, never convenience, and never
+-- actionable information a player reacts to. The reward kind vocabulary is
+-- closed at {title, border}; Renown has no spend lane and no power effect.
+invariant CosmeticOnly {
+    for d in Deed:
+        d.reward != null implies (d.reward.kind = title or d.reward.kind = border)
+    for c in Character:
+        c.renown >= 0
+    for c in Character:
+        c.active_title != null implies c.active_title.reward.kind = title
+}
+
+-- Renown scale is closed: a deed carries exactly one of the five quantized
+-- values. The account score can never decrease on a content patch because
+-- the score is a sum over fixed per-deed values and zero-renown deeds
+-- (luck-dependent or feat) sit outside the scoring set entirely.
+invariant RenownScaleIsClosed {
+    for d in Deed:
+        RenownValue(d.renown) in {0, 5, 10, 25, 50}
+}
+
+-- Every feat is zero-Renown. The trophy shelf carries no scoring weight, so
+-- era feats and world-first records can never move a rank. (Zero Renown does
+-- not imply feat: luck and dynamic-meta deeds are zero-Renown non-feats.)
+invariant FeatsAreZeroRenown {
+    for d in Deed:
+        d.feat = true implies d.renown = zero
+}
+
+-- The scoring set excludes zero-Renown deeds. The board SCORES; it does not
+-- COUNT, and luck can never move a rank. The one player-facing completion
+-- count is the shared predicate (see CompletionIsOnePredicate); the board
+-- displays Renown alone and no deed-count column rides the wire.
+invariant ScoringSetExcludesZeroRenown {
+    for ra in RankedAccount:
+        for d in RenownBearingDeeds(ra.account):
+            RenownValue(d.renown) > 0
+}
+
+-- Completion is ONE predicate. Every surface that displays a completion
+-- count consumes the same predicate: feats never count (numerator or
+-- denominator); a hidden deed is masked until earned; every other deed
+-- counts INCLUDING zero-Renown ones. The Book of Deeds header pair and the
+-- character sheet are the only completion surfaces; the Renown board is not.
+invariant CompletionIsOnePredicate {
+    for d in Deed:
+        d.feat = true implies not CountsTowardCompletion(d)
+    for d in Deed:
+        d.hidden = true implies MaskedUntilEarned(d)
+    for d in Deed:
+        not d.feat implies CountsTowardCompletion(d) or d.hidden
+}
+
+-- Idempotent completion: a replay of the same (character, deed) pair has no
+-- extra effect. Renown never double-awards; the earned set never grows a
+-- duplicate; the manual and evaluator grant arms are the same idempotent
+-- path.
+invariant CompletionIsIdempotent {
+    for c in Character:
+        for r1 in c.earned:
+            not exists r2 in c.earned where r2.deed = r1.deed and r2 != r1
+}
+
+-- Earned records are append-only. The catalogue is never reordered and a
+-- shipped deed's trigger is never retro-edited; widening a trigger list
+-- changes mid-progress fractions and re-scopes what an earned deed meant, so
+-- new coverage lands as new deeds. Removal means retiring acquisition paths,
+-- never deleting the record.
+invariant EarnedRecordsAreAppendOnly {
+    for d in Deed:
+        not RetroEdited(d)
+    for d in Deed:
+        not RemovedFromCatalogue(d)
+}
+
+-- The catalogue is append-only by table order. DEED_ORDER derives from table
+-- position, so an insertion never lands earlier than the existing tail.
+invariant CatalogueIsAppendOnly {
+    for c in Catalogue:
+        OrderedByAppendPosition(c.deeds)
+}
+
+-- Hidden deeds are invisible until earned, EXISTENCE included. Every
+-- anonymous or third-party public surface (the wiki generator, the rarity
+-- endpoint, third-party character sheets) strips them; an owner's own Book
+-- is the only surface that names an unearned hidden deed.
+invariant HiddenDeedsInvisibleUntilEarned {
+    for d in Deed:
+        d.hidden = true implies not ListedOnPublicSurface(d)
+}
+
+-- The no-permanently-missable rule. A deed whose earning window has passed
+-- for an individual character is healed at world join: granted from proof
+-- where persisted state demonstrates the action, or outright once no earn
+-- path can ever exist again. Nothing tied to retired content is deleted; it
+-- becomes a feat and stays visible.
+invariant NoPermanentlyMissableDeed {
+    for c in Character:
+        for d in c.deeds_in_scope:
+            PermanentlyUnreachable(c, d) implies AlreadyEarned(c, d)
+}
+
+-- The evaluator draws ZERO rng. Its placement at the tick tail (and on world
+-- join) cannot fork the shared draw order, so a deterministic seed produces
+-- the same unlocks across the offline client, the authoritative server, and
+-- the headless env.
+invariant EvaluatorDrawsZeroRng {
+    for c in Character:
+        EvaluatesWithoutRng(c)
+}
+
+-- The ranked-surface rule. Any number shown on a ranked surface must be
+-- recomputable by the player from an in-game surface or explicitly labeled
+-- with its set and scope. The board therefore displays Renown alone: there
+-- is no deed-count column, the account scope is stated in visible text, and
+-- the self line carries the board-scored Renown so a single-character player
+-- can verify it against their Book.
+invariant RankedSurfaceShowsRenownAlone {
+    for b in DeedsBoard:
+        not exists col in b.ranked where IsDeedCount(col)
+}
+
+-- The board scope is account, not character. The scoring set is deduped once
+-- per account: a deed earned by two characters of one account scores once,
+-- and the completion-time tie-break is the max over the scoring set of each
+-- deed's earliest earn across the account.
+invariant BoardScopedToAccountNotCharacter {
+    for ra in RankedAccount:
+        for d in RenownBearingDeeds(ra.account):
+            CountAccountsEarning(ra.account, d) = 1
+}
+
+-- The ranked ordering: score descending, then completion_time ascending
+-- (score-then-earliest), then account id ascending as the final
+-- deterministic tie-break. A higher score must rank above a lower one;
+-- equal scores break by earliest completion_time; equal times break by id.
+invariant RankedOrderIsScoreThenEarliest {
+    for b in DeedsBoard:
+        for ra in b.ranked:
+            let next = SuccessorOnBoard(b, ra)
+            next != null implies StrictlyRanksAbove(ra, next)
+}

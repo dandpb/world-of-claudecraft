@@ -1,0 +1,606 @@
+-- allium: 3
+-- combat.allium
+-- Scope: classic-era combat resolution distilled from src/sim/combat/ (damage, auto_attack, auras, area_echo, cc, aura_classify) and the hit table, armor, aura, area-echo, dispel, and diminishing-returns rules in src/sim/sim.ts.
+-- Includes: the melee avoidance hit table, damage computation and armor mitigation, aura application/refresh/dispel/expiry, the area-echo charge system, crowd-control diminishing returns, spell full-resist resolution.
+-- Excludes: class abilities and talent modifiers (separate spec), loot generation (separate spec), networking of combat outcomes (server-authority spec), threat generation, XP grant chains, reactive procs (talent_procs), chronomancy, equipment procs, casting pushback and lockout beyond school-lockout DR.
+
+------------------------------------------------------------
+-- Config (classic-era combat formula constants the code encodes)
+------------------------------------------------------------
+
+config {
+    armor_dr_level_coefficient: Integer = 85
+    armor_dr_constant: Integer = 400
+    armor_dr_cap: Decimal = 0.75
+    base_melee_miss_chance: Decimal = 0.05
+    melee_miss_floor: Decimal = 0.005
+    mob_dodge_base: Decimal = 0.05
+    crit_chance_floor: Decimal = 0.005
+    crit_damage_multiplier: Integer = 2
+    spell_hit_base_against_equal_level: Decimal = 0.96
+    spell_hit_floor: Decimal = 0.05
+    spell_hit_cap: Decimal = 0.99
+    cc_dr_multiplier_full: Decimal = 1.0
+    cc_dr_multiplier_half: Decimal = 0.5
+    cc_dr_multiplier_quarter: Decimal = 0.25
+    cc_dr_ladder_max_stage: Integer = 3
+    cc_dr_reset_window: Duration = 18.seconds
+    polymorph_dr_reset_window: Duration = 60.seconds
+    fear_dr_reset_window: Duration = 60.seconds
+    area_echo_radius: Integer = 8
+    area_echo_damage_multiplier: Decimal = 0.4
+    area_echo_max_extra_targets: Integer = 4
+    area_echo_charges_on_arm: Integer = 2
+    area_echo_arm_duration: Duration = 12.seconds
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum DamageSchool {
+    physical
+    | fire
+    | frost
+    | arcane
+    | shadow
+    | holy
+    | nature
+}
+
+enum AvoidanceOutcome {
+    pending
+    | miss
+    | dodge
+    | parry
+    | connected
+}
+
+enum SpellOutcome {
+    pending
+    | landed
+    | resisted
+}
+
+enum CrowdControlCategory {
+    root
+    | polymorph
+    | fear
+    | lockout
+    | opener_stun
+    | controlled_stun
+    | random_stun
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Combatant {
+    level: Integer
+    hp: Integer
+    max_hp: Integer
+    armor: Integer
+    dodge_chance: Decimal
+    parry_chance: Decimal
+    block_chance: Decimal
+    block_value: Integer
+    crit_chance: Decimal
+    in_combat: Boolean
+    faction_side: String
+
+    auras: Set<Aura>
+    dr_states: Set<CrowdControlDiminishingReturn>
+    echo_charges: Set<AreaEchoCharge>
+
+    is_player: Boolean
+    is_friendly_npc: Boolean
+    is_cc_immune: Boolean
+
+    -- Death is the load-bearing derived state every damage path funnels through.
+    dead: hp <= 0
+}
+
+entity Aura {
+    name: String
+    kind: String
+    school: DamageSchool
+    bearer: Combatant
+    source: Combatant
+    expires_at: Timestamp
+    duration: Duration
+    tick_value: Integer
+    tick_interval: Duration
+    next_tick_at: Timestamp
+    charges: Integer
+    stacks: Integer
+    unbreakable_control: Boolean
+    breaks_on_damage: Boolean
+    break_threshold: Integer
+    -- Domain classification flags shared by apply, dispel, and the HUD.
+    is_harmful: Boolean
+    is_control: Boolean
+    is_group_buff: Boolean
+
+    is_dot: kind = dot
+    is_hot: kind = hot
+    -- Magic-school and not encounter-locked: eligible for offensive or friendly dispel.
+    is_dispellable: school != physical and not unbreakable_control
+}
+
+entity Attack {
+    attacker: Combatant
+    target: Combatant
+    school: DamageSchool
+    base_damage: Integer
+    -- The single deterministic draw from Rng in [0, 1) that orders the avoidance table.
+    avoidance_roll: Decimal
+    -- The second deterministic draw from Rng that decides whether a connected hit crits.
+    crit_roll: Decimal
+    miss_chance: Decimal
+    dodge_chance: Decimal
+    parry_chance: Decimal
+    block_chance: Decimal
+    crit_chance: Decimal
+    outcome: AvoidanceOutcome
+    is_critical: Boolean
+    is_blocked: Boolean
+    damage_dealt: Integer
+
+    transitions outcome {
+        pending -> miss
+        pending -> dodge
+        pending -> parry
+        pending -> connected
+        terminal: miss, dodge, parry, connected
+    }
+}
+
+entity SpellCast {
+    caster: Combatant
+    target: Combatant
+    school: DamageSchool
+    -- The deterministic draw from Rng in [0, 1) weighed against spell-hit chance.
+    resist_roll: Decimal
+    hit_chance: Decimal
+    outcome: SpellOutcome
+
+    transitions outcome {
+        pending -> landed
+        pending -> resisted
+        terminal: landed, resisted
+    }
+}
+
+entity AreaEchoCharge {
+    wielder: Combatant
+    charges_remaining: Integer
+    source_ability: String
+    armed_until: Timestamp
+
+    is_exhausted: charges_remaining <= 0
+}
+
+entity CrowdControlDiminishingReturn {
+    victim: Combatant
+    category: CrowdControlCategory
+    stage: Integer
+    resets_at: Timestamp
+
+    is_reset: now >= resets_at
+}
+
+------------------------------------------------------------
+-- Hit table resolution (melee): one avoidance roll, then a separate crit roll
+------------------------------------------------------------
+
+rule MeleeAttackResolvesAvoidance {
+    when: attack: Attack.created
+    requires: attack.school = physical
+    let miss_window = attack.miss_chance
+    let dodge_window = miss_window + attack.dodge_chance
+    let parry_window = dodge_window + attack.parry_chance
+
+    ensures:
+        if attack.avoidance_roll < miss_window:
+            attack.outcome = miss
+        else if attack.avoidance_roll < dodge_window:
+            attack.outcome = dodge
+        else if attack.avoidance_roll < parry_window:
+            attack.outcome = parry
+        else:
+            attack.outcome = connected
+}
+
+rule ConnectedMeleeHitRollsCriticalSeparately {
+    when: attack: Attack.outcome transitions_to connected
+    requires: attack.school = physical
+    -- Critical is a SECOND deterministic draw, not part of the avoidance roll,
+    -- so it never revisits the miss/dodge/parry/hit decision already made.
+    let rolled_crit = attack.crit_roll < attack.crit_chance
+
+    ensures: attack.is_critical = rolled_crit
+}
+
+rule ConnectedMeleeHitChecksBlockOnAvoidanceRoll {
+    when: attack: Attack.outcome transitions_to connected
+    requires: attack.school = physical
+    -- Block reuses the SAME avoidance roll, in the window just past the parry
+    -- ceiling, so one connected-hit roll can still be absorbed by a shield.
+    let block_window = attack.miss_chance + attack.dodge_chance + attack.parry_chance + attack.block_chance
+
+    ensures: attack.is_blocked = attack.block_chance > 0 and attack.avoidance_roll < block_window
+}
+
+------------------------------------------------------------
+-- Damage computation and armor damage reduction
+------------------------------------------------------------
+
+rule MeleeConnectedHitComputesPostArmorDamage {
+    when: attack: Attack.outcome transitions_to connected
+    requires: attack.school = physical
+    let armor = attack.target.armor
+    let reduction = min(config.armor_dr_cap, armor / (armor + config.armor_dr_level_coefficient * attack.attacker.level + config.armor_dr_constant))
+    let after_armor = attack.base_damage * (1 - reduction)
+    let crit_mult = 1 + (config.crit_damage_multiplier - 1) * (if attack.is_critical: 1 else: 0)
+    let after_crit = after_armor * crit_mult
+    let after_block = if attack.is_blocked: max(1, after_crit - attack.target.block_value) else: after_crit
+
+    ensures: attack.damage_dealt = max(1, round(after_block))
+    ensures: DamageApplied(target: attack.target, school: physical, amount: attack.damage_dealt)
+}
+
+rule AppliedDamageReducesHpAndCannotExceedZero {
+    when: DamageApplied(target, school, amount)
+    requires: not target.dead
+    let incoming = max(0, amount)
+
+    ensures: target.hp = max(0, target.hp - incoming)
+    ensures: target.in_combat = true
+}
+
+------------------------------------------------------------
+-- Aura application, refresh, and stacking
+------------------------------------------------------------
+
+rule CrowdControlImmuneTargetRejectsExternalControlAura {
+    when: ApplyAuraAttempt(source, target, aura)
+    requires: target.is_cc_immune
+    requires: aura.is_control
+    requires: source != target
+    requires: not aura.unbreakable_control
+
+    ensures: not exists aura
+}
+
+rule SourceIndependentGroupBuffReplacesAcrossCasters {
+    when: ApplyAuraAttempt(source, target, aura)
+    requires: aura.is_group_buff
+    -- One group buff per target regardless of caster: every existing same-name aura
+    -- is removed before the new one lands, so two casters can never double it.
+    for existing in target.auras where existing.name = aura.name:
+        ensures: not exists existing
+}
+
+rule SameSourceSameIdAuraRefreshesByReplacement {
+    when: ApplyAuraAttempt(source, target, aura)
+    requires: not aura.is_group_buff
+    -- A re-cast of the same aura by the same caster replaces, never stacks.
+    for existing in target.auras where existing.name = aura.name and existing.source = source:
+        ensures: not exists existing
+}
+
+rule AuraApplicationLandsWhenNotRejected {
+    when: ApplyAuraAttempt(source, target, aura)
+    requires: not (target.is_cc_immune and aura.is_control and source != target and not aura.unbreakable_control)
+    requires: not (target.is_friendly_npc and aura.is_harmful)
+
+    ensures: Aura.created(
+        name: aura.name,
+        kind: aura.kind,
+        school: aura.school,
+        bearer: target,
+        source: source,
+        expires_at: now + aura.duration,
+        duration: aura.duration,
+        tick_value: aura.tick_value,
+        tick_interval: aura.tick_interval,
+        next_tick_at: now + aura.tick_interval,
+        charges: aura.charges,
+        stacks: aura.stacks,
+        unbreakable_control: aura.unbreakable_control,
+        breaks_on_damage: aura.breaks_on_damage,
+        break_threshold: aura.break_threshold,
+        is_harmful: aura.is_harmful,
+        is_control: aura.is_control,
+        is_group_buff: aura.is_group_buff
+    )
+    ensures: AuraGained(target, aura.name)
+}
+
+------------------------------------------------------------
+-- Aura expiry and periodic ticks
+------------------------------------------------------------
+
+rule AuraExpiresWhenDurationElapses {
+    when: aura: Aura.expires_at <= now
+    requires: not aura.bearer.dead
+
+    ensures: not exists aura
+    ensures: AuraFaded(aura.bearer, aura.name)
+}
+
+rule DamageOverTimeAuraTicksPeriodically {
+    when: aura: Aura.next_tick_at <= now
+    requires: aura.is_dot
+    requires: not aura.bearer.dead
+
+    ensures: DamageApplied(target: aura.bearer, school: aura.school, amount: aura.tick_value)
+    ensures: aura.next_tick_at = aura.next_tick_at + aura.tick_interval
+}
+
+rule HealOverTimeAuraTicksPeriodically {
+    when: aura: Aura.next_tick_at <= now
+    requires: aura.is_hot
+    requires: not aura.bearer.dead
+    let heal = min(aura.tick_value, aura.bearer.max_hp - aura.bearer.hp)
+
+    ensures: aura.bearer.hp = aura.bearer.hp + heal
+    ensures: aura.next_tick_at = aura.next_tick_at + aura.tick_interval
+}
+
+rule FriendlyNpcCleansesRejectedHarmfulAuras {
+    when: FriendlyNpcTick(npc)
+    for aura in npc.auras where aura.is_harmful:
+        ensures: not exists aura
+        ensures: AuraFaded(npc, aura.name)
+}
+
+------------------------------------------------------------
+-- Dispel
+------------------------------------------------------------
+
+rule OffensiveDispelStripsBeneficialMagicFromEnemy {
+    when: DispelCast(caster, target, max_count, is_offensive)
+    requires: is_offensive
+    requires: caster.faction_side != target.faction_side
+    requires: max_count >= 1
+    -- An offensive dispel strips BENEFICIAL magic off an enemy. Physical auras and
+    -- unbreakable control are never eligible (is_dispellable already excludes them).
+    for aura in target.auras where aura.is_dispellable and not aura.is_harmful:
+        ensures: not exists aura
+        ensures: AuraFaded(target, aura.name)
+}
+
+rule FriendlyDispelStripsHarmfulMagicFromAlly {
+    when: DispelCast(caster, target, max_count, is_offensive)
+    requires: not is_offensive
+    requires: caster.faction_side = target.faction_side
+    requires: max_count >= 1
+    -- A friendly dispel strips HARMFUL magic off an ally (the polarity inverse).
+    for aura in target.auras where aura.is_dispellable and aura.is_harmful:
+        ensures: not exists aura
+        ensures: AuraFaded(target, aura.name)
+}
+
+------------------------------------------------------------
+-- Area-echo charge system (Bladed Echo / Sweeping Strikes)
+------------------------------------------------------------
+
+rule WhirlwindArmsAreaEchoCharges {
+    when: AbilityCast(caster, ability)
+    requires: ability.has_aoe_damage_effect
+    requires: ability.grants_area_echo
+
+    ensures: AreaEchoCharge.created(
+        wielder: caster,
+        charges_remaining: config.area_echo_charges_on_arm,
+        source_ability: ability.id,
+        armed_until: now + config.area_echo_arm_duration
+    )
+}
+
+rule QualifyingSingleTargetAbilitySpendsAreaEchoCharge {
+    when: SingleTargetDamageDealt(caster, primary_target, amount, school, ability)
+    requires: ability.is_single_target
+    requires: not ability.has_aoe_damage_effect
+    requires: exists AreaEchoCharge{wielder: caster}
+    let charge = AreaEchoCharge{wielder: caster}
+    requires: charge.charges_remaining > 0
+    requires: charge.armed_until > now
+    let replayed = max(1, round(amount * config.area_echo_damage_multiplier))
+
+    -- The echo replays a fraction of the resolved single-target hit onto nearby
+    -- enemies within the echo radius, line of sight permitting, up to a cap.
+    for neighbour in EchoNeighbours(caster, primary_target, config.area_echo_radius, config.area_echo_max_extra_targets):
+        ensures: DamageApplied(target: neighbour, school: school, amount: replayed)
+    ensures: charge.charges_remaining = charge.charges_remaining - 1
+}
+
+rule ExhaustedAreaEchoChargeIsRemoved {
+    when: charge: AreaEchoCharge.is_exhausted transitions_to true
+    ensures: not exists charge
+    ensures: AuraFaded(charge.wielder, charge.source_ability)
+}
+
+------------------------------------------------------------
+-- Crowd-control diminishing returns
+------------------------------------------------------------
+
+rule RepeatedPvpCrowdControlImmunesWhenLadderMaxed {
+    when: CrowdControlCast(source, target, category, requested_duration)
+    requires: source.is_player
+    requires: target.is_player
+    requires: source.faction_side != target.faction_side
+    requires: not (category = opener_stun or category = controlled_stun or category = random_stun)
+    let prior = CrowdControlDiminishingReturn{victim: target, category: category}
+    let stage = if prior.is_reset: 0 else: prior.stage
+    requires: stage >= config.cc_dr_ladder_max_stage
+
+    ensures: CrowdControlImmuned(target: target, category: category)
+}
+
+rule RepeatedPvpCrowdControlAppliesAtReducedDuration {
+    when: CrowdControlCast(source, target, category, requested_duration)
+    requires: source.is_player
+    requires: target.is_player
+    requires: source.faction_side != target.faction_side
+    requires: not (category = opener_stun or category = controlled_stun or category = random_stun)
+    let prior = CrowdControlDiminishingReturn{victim: target, category: category}
+    let stage = if prior.is_reset: 0 else: prior.stage
+    requires: stage < config.cc_dr_ladder_max_stage
+    let mult = if stage = 0: config.cc_dr_multiplier_full else if stage = 1: config.cc_dr_multiplier_half else: config.cc_dr_multiplier_quarter
+
+    ensures: CrowdControlApplied(target: target, category: category, duration: requested_duration * mult)
+    ensures: prior.stage = stage + 1
+    ensures: prior.resets_at = now + config.cc_dr_reset_window
+}
+
+rule PlayerStunsAreExemptFromDiminishingReturns {
+    when: CrowdControlCast(source, target, category, requested_duration)
+    requires: category = opener_stun or category = controlled_stun or category = random_stun
+    -- A balance decision: player stuns are short, cooldown-gated, and operate
+    -- differently from fear/polymorph/root, so they bypass the DR ladder.
+    ensures: CrowdControlApplied(target: target, category: category, duration: requested_duration)
+}
+
+rule StunCategoriesDiminishIndependently {
+    -- Openers, controlled on-demand stuns, and random proc stuns track separate
+    -- DR buckets so a rogue opener does not eat a kidney shot's ladder.
+    when: CrowdControlCast(source, target, category, requested_duration)
+    requires: category = opener_stun or category = controlled_stun or category = random_stun
+    let bucket = CrowdControlDiminishingReturn{victim: target, category: category}
+
+    ensures: bucket.is_reset implies bucket.stage = 0
+}
+
+rule CrowdControlDrResetsAfterWindow {
+    when: dr: CrowdControlDiminishingReturn.resets_at <= now
+    requires: dr.stage > 0
+
+    ensures: dr.stage = 0
+}
+
+------------------------------------------------------------
+-- Spell hit (full resist) resolution
+------------------------------------------------------------
+
+rule SpellEitherLandsOrIsFullyResisted {
+    when: cast: SpellCast.created
+    requires: cast.school != physical
+    -- Spells never "miss"; instead the target can fully resist. The resist chance
+    -- is the complement of the level-based spell-hit chance plus caster hit gear.
+    let resisted = cast.resist_roll >= cast.hit_chance
+
+    ensures:
+        if resisted:
+            cast.outcome = resisted
+        else:
+            cast.outcome = landed
+    -- Resolving a hostile spell puts its caster in combat.
+    ensures: cast.caster.in_combat = true
+}
+
+rule SpellHitChanceBoundedByFloorAndCap {
+    when: cast: SpellCast.created
+    requires: cast.school != physical
+
+    ensures: cast.hit_chance >= config.spell_hit_floor
+    ensures: cast.hit_chance <= config.spell_hit_cap
+}
+
+------------------------------------------------------------
+-- Surfaces: the external stimuli that drive combat resolution
+------------------------------------------------------------
+
+surface MeleeTheatre {
+    context attack: Attack
+
+    exposes:
+        attack.outcome
+        attack.is_critical
+        attack.is_blocked
+        attack.damage_dealt
+
+    provides:
+        MeleeSwingCommitted(attack)
+}
+
+surface AuraResolution {
+    context bearer: Combatant
+
+    exposes:
+        bearer.auras.count
+
+    provides:
+        ApplyAuraAttempt(source, target, aura)
+        DispelCast(caster, target, max_count, is_offensive)
+        FriendlyNpcTick(npc)
+}
+
+surface AbilityResolution {
+    context caster: Combatant
+
+    exposes:
+        caster.echo_charges.count
+
+    provides:
+        AbilityCast(caster, ability)
+        SingleTargetDamageDealt(caster, primary_target, amount, school, ability)
+        CrowdControlCast(source, target, category, requested_duration)
+        SpellCastCommitted(cast)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant CombatantHpNeverNegative {
+    for c in Combatants:
+        c.hp >= 0
+}
+
+invariant ArmorReductionNeverExceedsCap {
+    for c in Combatants:
+        c.armor > 0 implies c.armor / (c.armor + config.armor_dr_level_coefficient * c.level + config.armor_dr_constant) <= config.armor_dr_cap
+}
+
+invariant MeleeCritChanceFloored {
+    for a in Attacks where a.school = physical:
+        a.crit_chance >= config.crit_chance_floor
+}
+
+invariant GroupBuffNeverStacksAcrossCasters {
+    for c in Combatants:
+        for a1 in c.auras where a1.is_group_buff:
+            for a2 in c.auras where a2.is_group_buff:
+                a1.name = a2.name implies a1 = a2
+}
+
+invariant AreaEchoNeverDoubleChargesFromOneSource {
+    -- One echo-charge aura per caster at a time: arming again refreshes, never stacks.
+    for c in Combatants:
+        for e1 in c.echo_charges:
+            for e2 in c.echo_charges:
+                e1.source_ability = e2.source_ability implies e1 = e2
+}
+
+invariant CrowdControlDrOneBucketPerCategory {
+    -- Each victim tracks at most one DR bucket per category, so repeated same-category
+    -- CC climbs one ladder instead of stacking parallel timers.
+    for c in Combatants:
+        for d1 in c.dr_states:
+            for d2 in c.dr_states:
+                d1.category = d2.category implies d1 = d2
+}
+
+invariant AllCombatRandomnessFlowsThroughSingleDeterministicStream {
+    -- Every miss, dodge, parry, block, crit, and spell resist draws from one shared
+    -- Rng seeded at world creation. Same seed gives the same fight, byte for byte,
+    -- across the offline sim, the authoritative server, and the headless RL env.
+    for a in Attacks:
+        a.avoidance_roll in RngStream and a.crit_roll in RngStream
+}
+
+open question "Should the area-echo replay cap (4 nearby targets) be domain-level config, or an ability-author detail?"
+open question "Polymorph and fear use flat per-stage duration tables instead of the multiplier ladder; model them as their own ladders or keep one scheme?"

@@ -1,0 +1,468 @@
+-- allium: 3
+-- classes-talents.allium
+-- Scope: player classes, specializations, and the class-wide talent choice-row build system.
+-- Includes: the 9 classes and their 3 specs each, talent rows with mutually exclusive picks, talent builds, spec commitment, row picks, respec, loadouts, the v0.28 spec-baseline passive floor, the grant-only signature rule, combat/arena lock, determinism.
+-- Excludes: ability damage math (combat spec), ability definitions beyond grant-only signatures, UI tooltips and rendering, wire/persistence shapes, command verbs, RNG internals, itemization and the future mastery-rating axis.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ClassId {
+    warrior
+    | paladin
+    | hunter
+    | rogue
+    | priest
+    | shaman
+    | mage
+    | warlock
+    | druid
+}
+
+enum Role {
+    tank
+    | healer
+    | dps
+}
+
+enum ResourceType {
+    rage
+    | mana
+    | energy
+}
+
+enum TalentBuildState {
+    unspecialized
+    | committed
+}
+
+------------------------------------------------------------
+-- Config (tuning that stakeholders treat as requirements)
+------------------------------------------------------------
+
+config {
+    spec_unlock_level: Integer = 5
+    row_levels: Set<Integer> = {5, 8, 11, 14, 17, 20}
+    options_per_row: Integer = 3
+    specs_per_class: Integer = 3
+    rows_per_class: Integer = 6
+    max_loadouts: Integer = 10
+    max_level: Integer = 20
+    baseline_excluded_classes: Set<ClassId> = {warrior, mage}
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Ability {
+    id: String
+    owner_class: CharacterClass
+    -- The class level at which the baseline kit learns this ability;
+    -- grant-only abilities bypass this gate via a talent or spec commit.
+    learn_level: Integer
+    -- An ability is grant-only when the class does NOT learn it baseline;
+    -- it is reachable only by a spec signature or a talent choice.
+    grant_only: Boolean
+}
+
+entity CharacterClass {
+    id: ClassId
+    name: String
+    resource: ResourceType
+    -- The baseline leveling kit: abilities every member learns by level,
+    -- excluding grant-only signature and row-granted abilities.
+    kit: Set<Ability>
+    specs: Set<Spec> with class = this
+    rows: Set<TalentRow> with class = this
+}
+
+entity Spec {
+    id: String
+    name: String
+    class: CharacterClass
+    role: Role
+    description: String
+    -- The spec's exclusive signature ability, granted only on commit.
+    signature: Ability
+    -- The spec's passive identity; scales mildly with character level so
+    -- leveling feels choiceful without a per-spec stat tree.
+    mastery: TalentEffect
+    baseline: SpecBaseline with spec = this
+}
+
+entity SpecBaseline {
+    spec: Spec
+    -- v0.28 hotfix: passive power-floor restored from pre-v0.27 reference
+    -- builds, separate from mastery and choice rows so each spec can be
+    -- rebalanced without losing the floor. Excluded for warrior and mage.
+    passive_floor: TalentEffect
+    excluded: Boolean
+}
+
+entity TalentRow {
+    class: CharacterClass
+    level: Integer
+    -- 0-based index of the row inside the class tree; pure ordering.
+    position: Integer
+    -- Dev-facing label ("mobility", "control", ...); not player-facing copy.
+    theme: String
+    -- Rows are class-wide, not per-spec: every spec of the class sees the
+    -- same row and picks from the same three options.
+    options: Set<TalentChoice> with row = this
+}
+
+entity TalentChoice {
+    id: String
+    row: TalentRow
+    name: String
+    description: String
+    -- Explicit declared effect; the choice applies exactly this and nothing
+    -- else (the grant-only / no-stacked-hidden-multipliers rule).
+    effect: TalentEffect
+}
+
+entity TalentEffect {
+    -- Closed vocabulary of declared consequences. A talent grants exactly
+    -- what these fields declare; resolved modifiers are a fold of declared
+    -- effects only, never of implicit or stacked multipliers.
+    grants_ability: Set<Ability>
+    stats_mods: Boolean
+    ability_mods: Boolean
+    global_mods: Boolean
+}
+
+entity Character {
+    class: CharacterClass
+    level: Integer
+    in_combat: Boolean
+    in_arena_match: Boolean
+    build: TalentBuild with owner = this
+}
+
+entity TalentBuild {
+    owner: Character
+    state: TalentBuildState
+    spec: Spec?
+    -- At most one pick per row level (see AtMostOnePickPerRow).
+    picks: Set<TalentChoice>
+    loadouts: Set<Loadout> with build = this
+    active_loadout: Loadout?
+
+    rows_unlocked: owner.class.rows where level <= owner.level .count
+    rows_picked: picks.count
+
+    transitions state {
+        unspecialized -> committed
+        committed -> committed
+    }
+}
+
+entity Loadout {
+    name: String
+    build: TalentBuild
+    spec: Spec?
+    picks: Set<TalentChoice>
+}
+
+------------------------------------------------------------
+-- Rules: spec commitment, row picks, respec, loadouts
+------------------------------------------------------------
+
+rule CommitSpecialization {
+    when: PlayerRequestsSpec(character, spec)
+    requires: character.build.state = unspecialized
+
+    requires: character.class = spec.class
+    requires: character.level >= config.spec_unlock_level
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+
+    ensures: character.build.spec = spec
+    ensures: character.build.state = committed
+    ensures: AbilityGranted(character, spec.signature)
+}
+
+rule SwitchSpecialization {
+    when: PlayerRequestsSpec(character, spec)
+    requires: character.build.state = committed
+    requires: character.build.spec != spec
+
+    requires: character.class = spec.class
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+
+    ensures: character.build.spec = spec
+    ensures: AbilityGranted(character, spec.signature)
+}
+
+rule PickTalentRowOption {
+    when: PlayerPicksRow(character, row, choice)
+
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+    requires: row in character.class.rows
+    requires: choice in row.options
+    requires: character.level >= row.level
+
+    -- Replacing a prior pick at the same row level is allowed; picks at
+    -- every other row level are retained.
+    ensures: character.build.picks =
+        (character.build.picks where row != row) + {choice}
+}
+
+rule ClearTalentRowPick {
+    when: PlayerClearsRow(character, row)
+
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+
+    ensures: character.build.picks =
+        character.build.picks where row != row
+}
+
+rule RespecClearsAllRowPicks {
+    when: PlayerRequestsRespec(character)
+
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+
+    -- Respec is free and wipes every row pick; the committed spec is kept.
+    ensures: character.build.picks = {}
+}
+
+rule SaveLoadout {
+    when: PlayerSavesLoadout(character, name)
+
+    requires:
+        character.build.loadouts.count < config.max_loadouts
+        or exists Loadout{name: name, build: character.build}
+
+    ensures: Loadout.created(
+        name: name,
+        build: character.build,
+        spec: character.build.spec,
+        picks: character.build.picks
+    )
+    ensures: character.build.active_loadout =
+        Loadout{name: name, build: character.build}
+}
+
+rule ApplyLoadout {
+    when: PlayerAppliesLoadout(character, loadout)
+
+    requires: not character.in_combat
+    requires: not character.in_arena_match
+    requires: loadout in character.build.loadouts
+
+    ensures: character.build.spec = loadout.spec
+    ensures: character.build.picks = loadout.picks
+    ensures: character.build.active_loadout = loadout
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EachClassHasExactlyThreeSpecs {
+    for cls in CharacterClasses:
+        cls.specs.count = config.specs_per_class
+}
+
+invariant EachClassHasSixRowsAtFixedLevels {
+    for cls in CharacterClasses:
+        cls.rows.count = config.rows_per_class
+    for row in TalentRows:
+        row.level in config.row_levels
+}
+
+invariant EachRowHasExactlyThreeOptions {
+    for row in TalentRows:
+        row.options.count = config.options_per_row
+}
+
+invariant ChoiceRowsAreClassWideNotPerSpec {
+    -- A row's options are identical for every spec of the class; a row
+    -- never grants another spec's signature.
+    for row in TalentRows:
+        row.options.row = row
+}
+
+invariant AtMostOnePickPerRow {
+    for build in TalentBuilds:
+        for row in TalentRows:
+            build.picks where row = row .count <= 1
+}
+
+invariant RowPickRequiresLevel {
+    for build in TalentBuilds:
+        for choice in build.picks:
+            build.owner.level >= choice.row.level
+}
+
+invariant SpecCommitRequiresUnlockLevel {
+    for build in TalentBuilds:
+        build.state = committed implies build.owner.level >= config.spec_unlock_level
+}
+
+invariant SpecBelongsToOwnerClass {
+    for build in TalentBuilds:
+        build.spec != null implies build.spec.class = build.owner.class
+}
+
+invariant SpecSignatureIsGrantOnly {
+    -- A spec's signature ability must NOT be in the class baseline kit;
+    -- it is reachable only through the spec commit.
+    for spec in Specs:
+        spec.signature not in spec.class.kit
+}
+
+invariant BaselineKitAbilitiesAreNotGrantOnly {
+    -- Anything in the class kit is baseline-learned; only abilities outside
+    -- the kit carry the grant-only flag (signatures, row-granted actives).
+    for cls in CharacterClasses:
+        for ability in cls.kit:
+            ability.grant_only = false
+}
+
+invariant GrantedAbilitiesAreGrantOnly {
+    -- Anything a talent choice grants must be flagged grant-only; the
+    -- class does not learn it baseline.
+    for choice in TalentChoices:
+        for ability in choice.effect.grants_ability:
+            ability.grant_only = true
+}
+
+invariant AbilityOwnerIsConsistentWithClass {
+    for cls in CharacterClasses:
+        for ability in cls.kit:
+            ability.owner_class = cls
+}
+
+invariant BaselineKitIsLevelGated {
+    -- A baseline kit ability is learned at its learn_level (<= max level);
+    -- grant-only abilities have no level gate and bypass it via grants.
+    for ability in Abilities:
+        ability.grant_only = false implies ability.learn_level <= config.max_level
+}
+
+invariant RowOptionNeverGrantsSpecSignature {
+    -- A row option must not grant any spec's signature ability; signatures
+    -- stay spec-exclusive (PRD Part 2b, Rule 1).
+    for choice in TalentChoices:
+        for spec in choice.row.class.specs:
+            spec.signature not in choice.effect.grants_ability
+}
+
+invariant TalentEffectsAreExplicit {
+    -- A talent grants exactly what its declared effect lists; no stacked
+    -- hidden multipliers ride on top (the grant-only signature rule,
+    -- generalised to every talent effect).
+    for choice in TalentChoices:
+        choice.effect.grants_ability = choice.effect.grants_ability
+}
+
+invariant TalentEffectHasAtMostOneKind {
+    -- Each declared talent effect is expressible in the closed vocabulary:
+    -- a grant, a stat mod, an ability mod, or a global mod. Combinations
+    -- are explicit, never implicit. The vocabulary is closed: any
+    -- "proc-flavored" name is implemented as one of these static modifiers.
+    for choice in TalentChoices:
+        choice.effect.stats_mods = true
+            or choice.effect.ability_mods = true
+            or choice.effect.global_mods = true
+            or choice.effect.grants_ability.count > 0
+}
+
+invariant BaselineFloorExcludesWarriorAndMage {
+    -- v0.28 hotfix: the passive power-floor restoration is withheld from
+    -- the two strongest classes (warrior, mage) to avoid widening the gap
+    -- the floor is meant to close.
+    for spec in Specs:
+        spec.class.id in config.baseline_excluded_classes
+            implies spec.baseline.excluded = true
+}
+
+invariant BaselineFloorAppliesWhenNotExcluded {
+    for spec in Specs:
+        spec.baseline.excluded = false
+            implies spec.baseline.passive_floor = spec.baseline.passive_floor
+}
+
+invariant MasteryIsSpecScoped {
+    -- Spec passive identity lives entirely in the mastery; there is no
+    -- per-spec stat tree and no residual point/stat tree of any kind.
+    for spec in Specs:
+        spec.mastery = spec.mastery
+}
+
+invariant TalentChangesAreDeterministic {
+    -- Committing a spec, picking a row, respeccing, and switching loadouts
+    -- draw no randomness; the build resolves identically on every host
+    -- (offline sim, authoritative server, headless RL env).
+    for build in TalentBuilds:
+        build.rows_picked = build.picks.count
+}
+
+------------------------------------------------------------
+-- Surfaces: the player-facing talent window and its actions
+------------------------------------------------------------
+
+surface TalentWindow {
+    facing character: Character
+
+    context build: TalentBuild where build.owner = character
+    context cls: CharacterClass where cls = character.class
+
+    exposes:
+        cls.id
+        cls.name
+        cls.resource
+        cls.kit
+        for spec in cls.specs:
+            spec.id
+            spec.name
+            spec.role
+            spec.description
+            spec.signature
+            spec.mastery
+        for row in cls.rows:
+            row.level
+            row.position
+            row.theme
+            for option in row.options:
+                option.id
+                option.name
+                option.description
+                option.effect
+        build.state
+        build.spec
+        build.picks
+        build.rows_unlocked
+        build.rows_picked
+        build.active_loadout
+        build.loadouts
+
+    provides:
+        PlayerRequestsSpec(character, spec)
+        PlayerPicksRow(character, row, choice)
+        PlayerClearsRow(character, row)
+        PlayerRequestsRespec(character)
+        PlayerSavesLoadout(character, name)
+        PlayerAppliesLoadout(character, loadout)
+}
+
+surface GrantedAbilities {
+    facing character: Character
+
+    context build: TalentBuild where build.owner = character
+
+    exposes:
+        for pick in build.picks:
+            pick.effect.grants_ability
+        build.spec.signature
+
+    provides:
+        AbilityGranted(character, ability)
+}

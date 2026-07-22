@@ -1,0 +1,1178 @@
+-- allium: 3
+-- dungeons-raids-delves.allium
+-- Scope: PvE instanced content in the deterministic sim: 5-player dungeons, the Nythraxis raid, delves, the delve lockpick minigame, the mythic+ keystone ladder, and the forged-drop upgrade layer.
+-- Includes: Instance claim/leave/reset lifecycle, difficulty selection (normal/heroic/mythic), per-dungeon and raid daily lockouts, the Heroic Marks economy, raid engage/wipe/reset, delve run lifecycle (enter, modules, affixes, bountiful, fail, complete), the lockpick attempt state machine (engage, step, burn-try, succeed, fail, abort, fog), the delve Marks shop, the mythic+ keystone ladder (levels, affix rotation, scaling, untimed clear, end-of-run chest), and the Valeforged/Swiftforged drop-time roll.
+-- Excludes: party/raid formation and the dungeon finder (social spec), the loot table contents and corpse-rights distribution (items spec), PvP arenas and competitive modes (pvp spec), talent/ability mechanics in combat (combat spec), the Nythraxis encounter script internals (only the raid behavioural shell: engage, wipe, defeat, lockout, reward eligibility), the Book of Deeds cosmetic tracking, the Drowned Litany rite/baptistry puzzle scripts (only the delve lifecycle shell), i18n, wire, and persistence shape.
+
+------------------------------------------------------------
+-- Sources: every dungeon/delve/lockpick rule below is distilled from the
+-- shipped sim code (src/sim/instances/, src/sim/delves/, src/sim/lockpick.ts,
+-- src/sim/content/delves/). The mythic+ keystone ladder and the forged-drop
+-- layer are distilled from docs/prd/mythic-plus-and-forged.md (and the forge
+-- table it specifies); those two blocks are marked PRD below because the
+-- code path does not yet ship.
+------------------------------------------------------------
+
+config {
+  -- Dungeons: instance pool, resets, daily lockout windows.
+  INSTANCE_EMPTY_TIMEOUT: Duration = 300.seconds,
+  RESET_COOLDOWN: Duration = 300.seconds,
+  STANDARD_PARTY_MAX: Integer = 5,
+  DELVE_PARTY_MAX: Integer = 2,
+  HEROIC_MIN_MOVE_SPEED: Integer = 8,
+  -- Heroic Marks participation awards (per final-boss kill).
+  HEROIC_MARKS_DUNGEON: Integer = 1,
+  HEROIC_MARKS_RAID: Integer = 3,
+  -- Delve daily economy: first N clears pay full, then a degraded rate.
+  DELVE_FULL_MARK_CLEARS: Integer = 3,
+  DELVE_NORMAL_REPEAT_MARK_CHANCE: Decimal = 0.5,
+  -- Bountiful coffer roll at run start (per tier).
+  DELVE_BOUNTIFUL_HEROIC: Decimal = 0.05,
+  DELVE_BOUNTIFUL_NORMAL: Decimal = 0.02,
+  -- Lockpick per-ante economy: ante IS the loot tier.
+  LOCKPICK_ANTE_TRIES_PREMIUM: Integer = 1,
+  LOCKPICK_ANTE_TRIES_MEDIUM: Integer = 2,
+  LOCKPICK_ANTE_TRIES_LOW: Integer = 3,
+  LOCKPICK_STEP_TIMEOUT_PREMIUM: Duration = 3.seconds,
+  LOCKPICK_STEP_TIMEOUT_MEDIUM: Duration = 6.seconds,
+  LOCKPICK_STEP_TIMEOUT_LOW: Duration = 9.seconds,
+  -- Mythic+ scaling (PRD). Compounding per-level factor on top of heroic.
+  MYTHIC_LEVEL_FLOOR: Integer = 2,
+  MYTHIC_HP_DAMAGE_PER_LEVEL: Decimal = 1.10,
+  MYTHIC_AFFIX_THRESHOLD_FIRST: Integer = 4,
+  MYTHIC_AFFIX_THRESHOLD_SECOND: Integer = 7,
+  MYTHIC_AFFIX_THRESHOLD_THIRD: Integer = 10,
+  MYTHIC_CHEST_PAID_CLEARS_PER_DAY: Integer = 2,
+  -- Forged-drop roll table at drop time (PRD).
+  FORGE_VALE_CHANCE_HEROIC: Decimal = 0.12,
+  FORGE_VALE_BONUS_PER_KEY: Decimal = 0.02,
+  FORGE_VALE_CAP: Decimal = 0.40,
+  FORGE_SWIFT_CHANCE_HEROIC: Decimal = 0.04,
+  FORGE_SWIFT_BONUS_PER_KEY: Decimal = 0.01,
+  FORGE_SWIFT_CAP: Decimal = 0.15
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Difficulty {
+  normal
+  | heroic
+  | mythic
+}
+
+enum InstanceStatus {
+  free
+  | claimed
+  | sealed
+}
+
+enum RaidPhase {
+  idle
+  | phase_one
+  | transition
+  | phase_two
+  | final_stand
+  | defeated
+  | wiped
+}
+
+enum DelveStatus {
+  forming
+  | in_progress
+  | completed
+  | failed
+}
+
+enum LockpickState {
+  in_progress
+  | success
+  | failed
+  | abandoned
+}
+
+enum LootTier {
+  premium
+  | medium
+  | low
+}
+
+enum ForgeTier {
+  base
+  | valeforged
+  | swiftforged
+}
+
+------------------------------------------------------------
+-- Value types
+------------------------------------------------------------
+
+value TierPreset {
+  cols: Integer,
+  rows: Integer,
+  width: Integer,
+  gate_count: Integer,
+  visibility_window: Integer,
+  trap_count: Integer,
+  allowed_actions: Set<PickAction>,
+  step_timeout: Duration
+}
+
+value PickAction {
+  delta: Integer
+}
+
+value ModuleList {
+  -- Deterministic permutation of module ids for one run; the finale module id
+  -- is always appended last. Iteration order is load-bearing.
+  rooms: Set<String>,
+  finale_module: String
+}
+
+------------------------------------------------------------
+-- External entities (modelled as relationships, not owned state)
+------------------------------------------------------------
+
+entity Party {
+  id: String,
+  members: Set<Player>,
+  is_raid: Boolean,
+  leader: Player
+}
+
+entity Player {
+  character_id: String,
+  level: Integer,
+  cls: String,
+  -- Per-character delve progression: the source of truth for shop gates,
+  -- mythic+ entry, and the daily economy.
+  delve_clears: Set<DelveClearKey>,
+  delve_marks: Integer,
+  delve_lore_unlocked: Set<String>,
+  best_cleared: Set<DungeonBestCleared>,
+  -- Daily lockout windows (heroic, delve) reset at realm daily boundary.
+  heroic_daily: HeroicDaily,
+  delve_daily: DelveDaily,
+  raid_lockouts: Set<RaidLockout>,
+  mythic_chests_today: Integer
+}
+
+entity Dungeon {
+  id: String,
+  suggested_players: Integer,
+  supports_difficulty: Set<Difficulty>,
+  final_boss: String,
+  -- raid_required dungeons force a raid group; raid_allowed dungeons may host one.
+  raid_required: Boolean,
+  raid_allowed: Boolean,
+  attunement_quest: String
+}
+
+entity DelveDef {
+  id: String,
+  min_level: Integer,
+  max_players: Integer,
+  tiers: Set<DelveTier>,
+  theme: String,
+  modules: Set<String>,
+  finale_module: String
+}
+
+entity DelveTier {
+  id: String,
+  enemy_level_bonus: Integer,
+  affix_count: Integer,
+  min_player_level: Integer,
+  first_clear_xp: Integer,
+  repeat_clear_xp: Integer
+}
+
+entity DelveClearKey {
+  delve_id: String,
+  tier_id: String
+}
+
+entity DungeonBestCleared {
+  dungeon_id: String,
+  level: Integer
+}
+
+entity HeroicDaily {
+  reward_window: String,
+  marked_dungeons: Set<String>
+}
+
+entity DelveDaily {
+  date: String,
+  first_clear_xp_keys: Set<String>,
+  mark_clears: Integer
+}
+
+------------------------------------------------------------
+-- Core entities
+------------------------------------------------------------
+
+-- A pre-allocated dungeon slot. The pool is fixed-size per dungeon; a run
+-- CLAIMS a free slot and RELEASES it back on leave/reset/empty-timeout. The
+-- party_key is the durable identity (party id, or solo:character_id) that lets
+-- a relog/reconnect rejoin the SAME live claim instead of minting a new one.
+entity Instance {
+  dungeon: Dungeon,
+  difficulty: Difficulty,
+  slot: Integer,
+  party_key: String,
+  status: InstanceStatus,
+  mobs: Set<Mob>,
+  objects: Set<InstanceObject>,
+  exit_portal: InstanceObject,
+  claimed_at: Timestamp,
+  reset_available_at: Timestamp,
+  empty_for: Duration,
+  -- Session participation watermarks for one claim. cleared_by is set when the
+  -- heroic final boss dies; entered_by records every player who walked through
+  -- the door this run (the back-line healer, the fallen raider). Both clear
+  -- when the slot returns to the pool.
+  cleared_by: Set<Player>,
+  entered_by: Set<Player>,
+
+  is_heroic: difficulty = heroic,
+  is_mythic: difficulty = mythic,
+  is_raid: dungeon.raid_allowed
+}
+
+entity Mob {
+  template_id: String,
+  level: Integer,
+  hp: Integer,
+  max_hp: Integer,
+  dead: Boolean,
+  in_combat: Boolean,
+  -- Heroic tuning overlay applied at spawn (per-dungeon multipliers on hp, dmg,
+  -- armor, mechanic numbers; plus boss CC/snare immunity).
+  mechanic_damage_mult: Decimal,
+  mechanic_heal_mult: Decimal,
+  cc_immune: Boolean,
+  slow_immune: Boolean,
+  spawn_instance: Instance
+}
+
+entity InstanceObject {
+  kind: String,
+  hp: Integer,
+  max_hp: Integer,
+  open: Boolean,
+  triggered: Boolean,
+  instance: Instance
+}
+
+-- The per-character keystone ladder for a dungeon. v1 ships NO key item in the
+-- bag: the unlocked level is tracked per character per dungeon. PRD-sourced.
+entity Keystone {
+  player: Player,
+  dungeon: Dungeon,
+  best_cleared: Integer,
+  -- The active affix set for the current UTC week, deterministically seeded
+  -- from the week string so every host agrees and a replay reproduces it.
+  active_affixes: Set<String>,
+  week_seed: String
+}
+
+-- A dungeon run binds a claimed instance to a keystone (mythic only) and
+-- carries the run-scoped participation set used for marks and lockouts.
+entity DungeonRun {
+  instance: Instance,
+  party: Party,
+  keystone: Keystone,
+  keystone_level: Integer,
+  affixes: Set<String>,
+  boss_defeated: Boolean,
+  completed: Boolean,
+  wiped: Boolean
+}
+
+-- A Nythraxis raid attempt. The behavioural shell: the encounter script
+-- (encounters/nythraxis.ts) drives phase transitions; this spec models the
+-- raid DOOR, the wipe reset, the kill lockout, and reward eligibility.
+entity RaidEncounter {
+  boss: Mob,
+  instance: Instance,
+  phase: RaidPhase,
+  participants_at_engage: Set<Player>,
+  participants_at_kill: Set<Player>,
+  daily_reset_at: Timestamp,
+
+  is_engaged: phase = phase_one or phase = transition or phase = phase_two or phase = final_stand,
+  is_resolved: phase = defeated or phase = wiped
+}
+
+-- A delve run slot. Delves are a SEPARATE pool from dungeons (a 2-player
+-- capped session with module progression and its own daily economy).
+entity DelveRun {
+  delve: DelveDef,
+  tier: DelveTier,
+  slot: Integer,
+  party_key: String,
+  seed: Integer,
+  affixes: Set<String>,
+  module_set: ModuleList,
+  module_index: Integer,
+  exit_portal_open: Boolean,
+  -- Ultra-rare flag: the finale chest is a Bountiful Coffer (purple) that
+  -- only yields to a heroic-tier + premium-ante lockpick solve and guarantees
+  -- a signature rare. Rolled once at claim time.
+  bountiful: Boolean,
+  objective_complete: Boolean,
+  status: DelveStatus,
+  deaths_this_run: Set<Player>,
+  -- Whole-run roster watermark: the most players ever inside this run. The
+  -- solo-clear restriction deed reads it at completion.
+  max_party_size: Integer,
+  finale_chest: DelveChest,
+  active_lockpick: LockpickAttempt,
+  empty_for: Duration,
+
+  is_heroic: tier.id = "heroic"
+}
+
+-- The finale chest of a delve. The kind determines the path: a locked_chest
+-- requires a lockpick solve, a drowned_reliquary is a per-member rolled loot
+-- source, a reward_chest is the legacy open-on-interact fallback.
+entity DelveChest {
+  kind: String,
+  run: DelveRun,
+  attempt_available: Boolean,
+  looted: Boolean,
+  loot_tier: LootTier,
+  owner: Player,
+  pending_loot: Set<LootSlot>
+}
+
+entity LootSlot {
+  item_id: String,
+  count: Integer
+}
+
+-- A server-authoritative lockpicking attempt on a DelveChest. Single
+-- interactor per run. The full LockSpec never leaves the server; only the
+-- fogged visible-cells window is ever serialized to a client.
+entity LockpickAttempt {
+  chest: DelveChest,
+  owner: Player,
+  ante: Integer,
+  loot_tier: LootTier,
+  pages: Set<LockpickBoard>,
+  page_index: Integer,
+  col: Integer,
+  row: Integer,
+  tries_left: Integer,
+  tries_total: Integer,
+  -- Sim-tick deadline for the CURRENT step. Re-armed on every move; the server
+  -- burns a try when tick_count reaches it. The client never reports a timeout.
+  step_deadline_at: Timestamp,
+  state: LockpickState,
+
+  base_seed: Integer
+}
+
+-- One lock "page" of an attempt. A multi-page gauntlet must be cleared
+-- back-to-back on a single try. Generated reverse-construction: a guaranteed
+-- solution path is carved first, then open-row bands are wrapped around it,
+-- so a flawless solve always exists.
+entity LockpickBoard {
+  seed: Integer,
+  preset: TierPreset,
+  gate_columns: Set<Integer>,
+  start_row: Integer,
+  seat_row: Integer,
+  attempt: LockpickAttempt,
+
+  is_solvable: true
+}
+
+-- A per-player heroic daily lockout. The reward_window token identifies the
+-- realm reset window; a lockout in the current window bars a fresh heroic
+-- claim on the same dungeon. Lockouts are difficulty-scoped (heroic never
+-- consumes normal and vice versa).
+entity HeroicLockout {
+  player: Player,
+  dungeon: Dungeon,
+  locked_until: Timestamp,
+  reward_window: String,
+  is_expired: locked_until <= now
+}
+
+entity RaidLockout {
+  player: Player,
+  dungeon: Dungeon,
+  difficulty: Difficulty,
+  locked_until: Timestamp,
+  is_expired: locked_until <= now
+}
+
+-- Heroic Marks: the participation token awarded when a heroic final boss dies.
+-- An inventory item (not a PlayerMeta counter), spent at the Heroic Quartermaster.
+entity HeroicMark {
+  holder: Player,
+  quantity: Integer
+}
+
+-- The drop-time forge roll for a single gear drop from a heroic final boss,
+-- the heroic bonus table, or a mythic+ chest. PRD-sourced.
+entity ForgedDrop {
+  base_item: String,
+  tier: ForgeTier,
+  move_speed_pct: Integer,
+  bound_to: Player,
+
+  is_valeforged: tier = valeforged,
+  is_swiftforged: tier = swiftforged
+}
+
+------------------------------------------------------------
+-- Surfaces: the external stimuli that drive instance/delve/lockpick flow
+------------------------------------------------------------
+
+surface InstanceEntry {
+  context player: Player
+
+  exposes:
+    player.position_in_instance
+
+  provides:
+    WalkThroughDungeonDoor(player, dungeon)
+    WalkThroughInstanceExit(player)
+    RequestResetAll(player)
+    SelectDifficulty(player, difficulty)
+}
+
+surface DelveEntry {
+  context player: Player
+
+  provides:
+    EnterDelve(player, delve, tier)
+    LeaveDelve(player)
+    InteractDelveObject(player, object)
+    StepOnPressurePlate(player, plate)
+    CollectDelveChestLoot(player, chest)
+}
+
+surface LockpickFlow {
+  context attempt: LockpickAttempt
+
+  exposes:
+    attempt.state
+    attempt.tries_left
+    attempt.col
+    attempt.row
+
+  provides:
+    LockpickEngage(player, chest, ante)
+    LockpickAction(player, action)
+    LockpickAbort(player)
+}
+
+surface MarksVendor {
+  context player: Player
+
+  exposes:
+    player.delve_marks
+    HeroicMark{holder: player}.quantity
+
+  provides:
+    BuyHeroicVendorItem(player, item)
+    BuyDelveShopItem(player, delve, item)
+    UpgradeDelveCompanion(player, companion)
+}
+
+------------------------------------------------------------
+-- ENTERING A DUNGEON INSTANCE
+------------------------------------------------------------
+
+-- A walk through a dungeon door claims a free slot for the player's party key
+-- at the player's current difficulty selection, or rejoins the party's LIVE
+-- claim if one exists. Raid-required dungeons force a raid group; raid-only
+-- dungeons (the arena) additionally gate on the attunement quest.
+rule ClaimOrRejoinDungeonInstance {
+  when: WalkThroughDungeonDoor(player, dungeon)
+  requires: not PlayerDead(player)
+  requires: not (dungeon.raid_required and not PartyOf(player).is_raid)
+  requires: not (PartyOf(player).is_raid and not dungeon.raid_allowed)
+  requires: dungeon.attunement_quest = null or HasCompletedQuest(player, dungeon.attunement_quest)
+  requires: not NythraxisDoorSealedFor(player, dungeon)
+  requires: not RaidLockedFromFreshClaim(player, dungeon)
+  requires: not ConflictingResetLock(player, dungeon)
+  let party_key = DurableKey(player)
+  let selection = SelectedDifficulty(player)
+  let live = LiveInstance(dungeon, party_key)
+  let slot = FreeSlot(dungeon)
+  let chosen_difficulty = ClampDifficulty(dungeon, selection)
+
+  ensures:
+    if live != null:
+      live.party_key = party_key
+      RejoinInstance(player, live)
+    else:
+      slot.party_key = party_key
+      slot.difficulty = chosen_difficulty
+      slot.status = claimed
+      SpawnMobsAndExit(slot)
+  ensures: AddEnteredBy(LiveInstance(dungeon, party_key), player)
+}
+
+-- The royal door seals once Nythraxis is engaged (pulled, alive, pre-death)
+-- and reopens on his death or a full raid wipe.
+rule NythraxisDoorSealsOnEngage {
+  when: encounter: RaidEncounter.phase transitions_to phase_one
+  requires: encounter.boss.in_combat = true
+
+  ensures: encounter.instance.status = sealed
+}
+
+rule NythraxisDoorReopensOnDefeat {
+  when: encounter: RaidEncounter.phase transitions_to defeated
+
+  ensures: encounter.instance.status = claimed
+}
+
+rule NythraxisDoorReopensOnWipe {
+  when: encounter: RaidEncounter.phase transitions_to wiped
+
+  ensures: encounter.instance.status = claimed
+}
+
+------------------------------------------------------------
+-- INSTANCE LOCKOUTS AND RESETS
+------------------------------------------------------------
+
+-- The reset escape hatch: a leader may abandon the party's standard-difficulty
+-- claims to switch difficulty. Raid claims are excluded (they reset only via
+-- their own lifecycle). The selected difficulty MUST differ from the live
+-- claim's, so Reset All cannot become a zero-difficulty boss-respawn loop.
+rule ResetAllStandardInstances {
+  when: RequestResetAll(player)
+  requires: IsPartyLeader(player)
+  let owned = StandardInstancesOwnedBy(player)
+  let selection = SelectedDifficulty(player)
+  requires: AnyResettable(owned, selection)
+  requires: AllResetReady(owned)
+  requires: NoPlayersInsideAny(owned)
+  requires: NoLootableMobInAny(owned)
+
+  for inst in owned where inst.difficulty != ClampDifficulty(inst.dungeon, selection):
+    ensures: FreeInstance(inst)
+    ensures: ReclaimInstance(inst, DurableKey(player), ClampDifficulty(inst.dungeon, selection))
+    ensures: inst.reset_available_at = now + RESET_COOLDOWN
+    ensures: SetResetLock(player, inst.dungeon, inst.reset_available_at)
+}
+
+-- A freed slot returns to the pool. Mobs/objects/exit are despawned; the
+-- participation watermarks clear.
+rule FreeInstanceSlot {
+  when: inst: Instance.status transitions_to free
+
+  ensures: DespawnMobs(inst)
+  ensures: DespawnObjects(inst)
+  ensures: inst.party_key = null
+  ensures: inst.difficulty = normal
+  ensures: inst.cleared_by = EmptySet()
+  ensures: inst.entered_by = EmptySet()
+  ensures: inst.reset_available_at = now
+}
+
+-- The 5-minute empty timer auto-frees an abandoned claim. The sweep is once
+-- per sim second; a single occupied body resets the timer.
+rule EmptyInstanceAutoFrees {
+  when: inst: Instance.empty_for >= INSTANCE_EMPTY_TIMEOUT
+  requires: inst.status = claimed
+  requires: not AnyPlayerInside(inst)
+
+  ensures: inst.status = free
+}
+
+------------------------------------------------------------
+-- HEROIC LOCKOUT AND MARKS
+------------------------------------------------------------
+
+-- When a heroic final boss dies, every eligible participant (the claim-owning
+-- group plus anyone physically inside, plus every credited kill participant
+-- even if they left) takes the realm-reset daily lockout, scoped to the
+-- :heroic lockout id. The lockout is the income gate; marks are the reward.
+rule HeroicBossKillLocksParticipants {
+  when: e: Mob.dead transitions_to true
+  requires: e.spawn_instance.is_heroic
+  requires: e.spawn_instance.dungeon.final_boss = e.template_id
+  let locked_until = RealmResetFrom(now)
+  let reward_window = WindowToken(locked_until)
+  let recipients = CreditedParticipants(e)
+  let lockout_recipients = ClaimAndRoomUnion(e.spawn_instance, recipients)
+
+  for meta in lockout_recipients:
+    ensures: HeroicLockout.created(player: meta, dungeon: e.spawn_instance.dungeon, locked_until: locked_until, reward_window: reward_window)
+    ensures: AddClearedBy(e.spawn_instance, meta)
+}
+
+-- Marks pay only to players who BOTH took the lockout AND entered this run.
+-- A recipient present at the kill takes marks to bags; one locked from afar
+-- who entered this run (a back-line healer, a fallen raider) gets them mailed.
+-- A member who never entered (a door-camper, an alt parked in town) takes the
+-- lockout with NO pay: roster membership alone is not income.
+rule AwardHeroicMarksOnCreditedKill {
+  when: e: Mob.dead transitions_to true
+  requires: e.spawn_instance.is_heroic
+  requires: e.spawn_instance.dungeon.final_boss = e.template_id
+  requires: CreditedParticipants(e).count > 0
+  let marks = MarksForDungeon(e.spawn_instance.dungeon)
+  let recipients = CreditedParticipants(e)
+
+  for meta in recipients where EnteredThisRun(e.spawn_instance, meta):
+    ensures: GrantMarks(meta, marks, PresentAtKill(meta, e))
+}
+
+------------------------------------------------------------
+-- RAID (NYTHRAXIS) LIFECYCLE
+------------------------------------------------------------
+
+-- Wipe-or-kill is the only reset: when every player in the boss room is dead
+-- the encounter resets, the boss evades home at full health, and the sealed
+-- doors reopen so the raid can run back for another attempt.
+rule RaidWipesWhenRoomIsEmpty {
+  when: encounter: RaidEncounter.phase transitions_to phase_one
+  requires: PlayersInRoom(encounter.boss).count = 0
+
+  ensures: encounter.phase = wiped
+  ensures: encounter.boss.hp = encounter.boss.max_hp
+  ensures: DropThreatAndAuras(encounter.boss)
+}
+
+rule RaidBossDeathLocksParticipants {
+  when: encounter: RaidEncounter.phase transitions_to defeated
+  let dungeon = encounter.instance.dungeon
+  let lockout_kind = LockoutKindFor(dungeon, encounter.instance.difficulty)
+  let until = RealmResetFrom(now)
+  let union = RoomClaimUnion(encounter.instance)
+
+  for meta in union:
+    ensures: RaidLockout.created(player: meta, dungeon: dungeon, difficulty: encounter.instance.difficulty, locked_until: until)
+}
+
+------------------------------------------------------------
+-- DELVES: ENTER, MODULES, AFFIXES, BOUNTIFUL
+------------------------------------------------------------
+
+-- Entering a delve validates level, party-size cap, and the cross-instance
+-- exclusion (not already in a dungeon/arena/delve/trade/duel), then claims a
+-- free run slot at the chosen tier. A solo runner auto-summons the delve
+-- companion. Seed, affixes, modules, and the bountiful flag all roll at claim.
+rule EnterDelveRun {
+  when: EnterDelve(player, delve, tier)
+  requires: not PlayerDead(player)
+  requires: not InDungeonOrArenaOrDelve(player)
+  requires: not InTradeOrDuelOrArena(player)
+  requires: tier in delve.tiers
+  requires: player.level >= delve.min_level
+  requires: tier.min_player_level = null or player.level >= tier.min_player_level
+  requires: PartyOf(player).members.count <= delve.max_players
+  let key = DurableKey(player)
+  let live = LiveDelveRun(delve, key)
+  let slot = FreeDelveSlot(delve)
+
+  ensures:
+    if live != null:
+      live.empty_for = 0
+      RejoinDelve(player, live)
+    else:
+      slot.party_key = key
+      slot.tier = tier
+      slot.status = in_progress
+      slot.seed = RngInt(1, 2147483647)
+      slot.affixes = RollDelveAffixes(delve, tier, slot.seed)
+      slot.module_set = PickDelveModules(delve, slot.seed, tier)
+      slot.bountiful = RollBountiful(slot.seed, tier)
+      SpawnFirstModule(slot)
+}
+
+-- Delve affixes are drawn from the theme-matched IMPLEMENTED pool (affixes
+-- with a sim hook), via a SEEDED sub-stream that does not perturb the global
+-- rng draw order. Normal delves roll zero affixes.
+rule RollDelveAffixes {
+  when: e: DelveRun.status transitions_to in_progress
+  requires: e.is_heroic
+  let pool = ImplementedAffixes(e.delve.theme)
+  let shuffled = SeededShuffle(pool, AffixSeed(e.seed))
+
+  ensures: e.affixes = Take(shuffled, e.tier.affix_count)
+}
+
+-- The Bountiful coffer roll: 5% on Heroic, 2% on Normal, drawn from a sub-
+-- stream derived from run.seed (NOT the shared stream) so it stays
+-- deterministic without perturbing chest-loot draw order. Single Rng draw.
+rule RollBountifulCoffer {
+  when: e: DelveRun.status transitions_to in_progress
+  let chance = if e.is_heroic: DELVE_BOUNTIFUL_HEROIC else: DELVE_BOUNTIFUL_NORMAL
+
+  ensures: e.bountiful = SeededChance(BountifulSeed(e.seed), chance)
+}
+
+-- Modules are a deterministic per-run permutation: shuffle the non-finale pool
+-- by seed, take the tier's room count, append the finale module id last.
+rule PickDelveModulesForRun {
+  when: e: DelveRun.status transitions_to in_progress
+  let pool = ModulePool(e.delve)
+  let shuffled = SeededShuffle(pool, e.seed)
+  let count = ModuleCountForTier(e.delve, e.tier)
+
+  ensures: e.module_set = ModuleList(rooms: Take(shuffled, count), finale_module: e.delve.finale_module)
+  ensures: e.module_index = 0
+}
+
+-- Room-cleared + every pressure plate triggered opens the exit portal. The
+-- exit portal advances the run to the next module on walk-in.
+rule OpenDelveExitPortalOnRoomClear {
+  when: tick: Tick.t <= now
+  requires: tick.target.status = in_progress
+  requires: not LiveMobsInModule(tick.target)
+  requires: AllPuzzlesInModuleTriggered(tick.target)
+  requires: not tick.target.exit_portal_open
+
+  ensures: tick.target.exit_portal_open = true
+}
+
+rule AdvanceDelveModuleOnWalkIn {
+  when: PlayerWalksIntoExitPortal(player, run)
+  requires: run.exit_portal_open
+  requires: run.module_index < RoomCount(run.module_set) - 1
+
+  ensures: run.module_index = run.module_index + 1
+  ensures: SpawnModule(run, run.module_index)
+}
+
+-- When the finale boss dies, a locked_chest rises on the dais and the chest's
+-- attemptAvailable flag is set true. (The Drowned Litany rite puzzle is an
+-- alternative path, out of scope here.)
+rule FinaleBossDeathSpawnsLockedChest {
+  when: e: Mob.dead transitions_to true
+  requires: e.template_id = FinaleBossOf(e.spawn_instance)
+  let run = DelveRunForMob(e)
+
+  ensures: DelveChest.created(kind: "locked_chest", run: run, attempt_available: true, looted: false, loot_tier: low, owner: null, pending_loot: EmptySet())
+  ensures: run.objective_complete = true
+}
+
+------------------------------------------------------------
+-- DELVE COMPLETION, FAILURE, AND DAILY ECONOMY
+------------------------------------------------------------
+
+-- Failing a run: every party member dead. Eject to the delve door, free the
+-- slot. Pets are restored.
+rule FailDelveRunOnFullWipe {
+  when: run: DelveRun.status transitions_to failed
+  requires: run.party_key != null
+  let members = PartyMembersOf(run)
+
+  for pid in members:
+    ensures: EjectToDelveDoor(pid)
+    ensures: RestorePet(pid)
+    ensures: DelveRunFailed(pid, run.delve, run.tier)
+  ensures: FreeDelveRun(run)
+}
+
+-- A clear grants: first-clear or repeat XP, Marks (daily-bracketed), copper
+-- (rng roll), the next lore entry, pet restore, and the deed circuit. Shared
+-- by BOTH completion paths (the lockpick succeed and the open-chest legacy).
+rule GrantDelveClearTo {
+  when: chest: DelveChest.looted transitions_to true
+  let run = chest.run
+  requires: run.status = in_progress
+  let members = PartyMembersOf(run)
+  let clear_key = ClearKey(run)
+
+  for pid in members:
+    ensures: GrantClearToMember(pid, run, clear_key)
+  ensures: run.status = completed
+  ensures: OpenSurfaceExit(run)
+}
+
+-- Mark payout: first N clears/day pay full (2 Heroic / 1 Normal), then Heroic
+-- guarantees 1 while Normal has a 50% rng chance of 1 (single Rng draw) or 0.
+rule DelveDailyMarkPayout {
+  when: e: DelveRun.status transitions_to completed
+  let members = PartyMembersOf(e)
+
+  for pid in members:
+    let meta = PlayerMetaFor(pid)
+    let heroic = e.is_heroic
+    let paid = if meta.delve_daily.mark_clears < DELVE_FULL_MARK_CLEARS:
+      if heroic: 2 else: 1
+    else:
+      if heroic: 1 else: if RngChance(DELVE_NORMAL_REPEAT_MARK_CHANCE): 1 else: 0
+    ensures: GrantMarks(meta, paid, true)
+}
+
+-- The delve Marks shop: gates are 'available', 'clears:N' (any-tier total),
+-- or 'heroicClear' (>= 1 heroic clear). Server re-validates gate + balance.
+rule BuyFromDelveShop {
+  when: BuyDelveShopItem(player, delve, item)
+  requires: AtDelveBoardNpc(player, delve)
+  requires: GateUnlocked(player.delve_clears, delve, GateFor(delve, item))
+  requires: player.delve_marks >= PriceFor(delve, item)
+
+  ensures: player.delve_marks = player.delve_marks - PriceFor(delve, item)
+  ensures: GrantItem(player, item, 1)
+}
+
+------------------------------------------------------------
+-- LOCKPICK: ENGAGE, STEP, BURN-TRY, SUCCEED, FAIL, ABORT
+------------------------------------------------------------
+
+-- Engaging an ante commits the loot tier (ante 1 = premium, 2 = medium, 3 =
+-- low) and the try count, generates the page set from a per-chest seed, and
+-- arms the per-step clock. A Bountiful Coffer rejects any ante but premium.
+rule LockpickEngageStartsAttempt {
+  when: LockpickEngage(player, chest, ante)
+  requires: chest.kind = "locked_chest"
+  requires: WithinRange(player, chest)
+  requires: not chest.looted
+  requires: chest.attempt_available
+  requires: ante = 1 or ante = 2 or ante = 3
+  requires: not LiveLockpickFor(chest.run)
+  let run = chest.run
+  let is_coffer = run.bountiful and chest = run.finale_chest
+  requires: not is_coffer or ante = 1
+  let preset = PresetForRun(is_coffer, run.tier)
+  let base_seed = ChestSeed(run.seed, chest)
+  let page_count = AnteToPageCount(ante)
+  let pages = GenerateLockPages(base_seed, preset, page_count)
+  let start_row = FirstPageStartRow(pages)
+
+  ensures: LockpickAttempt.created(chest: chest, owner: player, ante: ante, loot_tier: AnteToTier(ante), pages: pages, page_index: 0, col: 0, row: start_row, tries_left: AnteToTries(ante), tries_total: AnteToTries(ante), step_deadline_at: now + AnteToTimeout(ante), state: in_progress, base_seed: base_seed)
+}
+
+-- One pick action. The action's delta is applied; the new column's open rows
+-- decide slip (blocked), bind (gate column missed), trap (open-looking ward),
+-- advanced (open), or success (last column seat). Slip/bind/trap/timeout burn
+-- a try; advanced/page_cleared/success re-arm the per-step clock.
+rule LockpickStepAction {
+  when: LockpickAction(player, action)
+  let attempt = LiveLockpickFor(DelveRunForPlayer(player))
+  requires: attempt != null
+  requires: attempt.owner = player
+  requires: attempt.state = in_progress
+  requires: action = abort or ActionAllowed(CurrentPage(attempt), action)
+  let spec = CurrentPage(attempt)
+
+  ensures:
+    if action = abort:
+      attempt.state = abandoned
+    else:
+      let outcome = StepLock(spec, attempt.col, attempt.row, action)
+      if outcome.result = slip or outcome.result = bind or outcome.result = trap:
+        BurnTry(attempt)
+      else if outcome.result = success and MorePagesRemain(attempt):
+        AdvanceToNextPage(attempt)
+        attempt.step_deadline_at = now + AnteToTimeout(attempt.ante)
+      else:
+        attempt.col = outcome.col
+        attempt.row = outcome.row
+        attempt.step_deadline_at = now + AnteToTimeout(attempt.ante)
+}
+
+-- The server-tick clock is the SOLE timeout authority: when the active step
+-- deadline passes, the sim burns a try. The client never reports a timeout.
+rule LockpickStepTimesOutOnClock {
+  when: attempt: LockpickAttempt.step_deadline_at <= now
+  requires: attempt.state = in_progress
+
+  ensures: BurnTry(attempt)
+}
+
+-- Success: the chest is looted by the picker, the loot is rolled from the
+-- tier table (single seeded Rng draw per slot), the run is marked complete,
+-- and the surface exit opens. A bonus tier-scaled marks + copper grant fires
+-- for every party member.
+rule LockpickAttemptSucceeds {
+  when: attempt: LockpickAttempt.state transitions_to success
+  let chest = attempt.chest
+  let run = chest.run
+  let is_coffer = run.bountiful and chest = run.finale_chest
+  let items = RollChestLoot(attempt.loot_tier, ClassOf(attempt.owner), RngFor(run), is_coffer)
+
+  ensures: chest.looted = true
+  ensures: chest.attempt_available = false
+  ensures: chest.loot_tier = attempt.loot_tier
+  ensures: chest.owner = attempt.owner
+  ensures: chest.pending_loot = items
+  ensures: GrantDelveRewards(run)
+  ensures: GrantLockpickBonus(run, attempt.loot_tier)
+  ensures: OpenSurfaceExit(run)
+}
+
+-- Failure: the chest is jammed for good (the whole delve must be re-cleared
+-- for another attempt), but the surface exit opens so a failed pick never
+-- strands the party in a cleared delve.
+rule LockpickAttemptFails {
+  when: attempt: LockpickAttempt.state transitions_to failed
+  let chest = attempt.chest
+  let run = chest.run
+
+  ensures: chest.attempt_available = false
+  ensures: OpenSurfaceExit(run)
+}
+
+-- Abandon (player leaves/disconnects): the session tears down but the attempt
+-- is PRESERVED, so the player can re-engage later. Attempt_available stays
+-- true on the chest.
+rule LockpickAbandonPreservesAttempt {
+  when: LockpickAbort(player)
+  let attempt = LiveLockpickFor(DelveRunForPlayer(player))
+  requires: attempt != null
+  requires: attempt.owner = player
+
+  ensures: attempt.state = abandoned
+  ensures: PreserveChestAttempt(attempt.chest)
+}
+
+------------------------------------------------------------
+-- MYTHIC+ KEYSTONE LADDER (PRD: docs/prd/mythic-plus-and-forged.md)
+-- The code path does not yet ship; the rules below distil the PRD contract.
+------------------------------------------------------------
+
+-- A mythic+ run extends the instance with a keystone level. The party may
+-- enter at min(best_cleared across members) + 1, so a friend can be pulled up
+-- one level but the ladder cannot be skipped. Level is fixed for the life of
+-- the instance.
+rule MythicEntryAtMinBestClearedPlusOne {
+  when: WalkThroughDungeonDoor(player, dungeon)
+  requires: SelectedDifficulty(player) = mythic
+  let party = PartyOf(player)
+  let floor = MinBestCleared(party, dungeon) + 1
+  requires: floor >= MYTHIC_LEVEL_FLOOR
+  let live = LiveInstance(dungeon, DurableKey(player))
+  let slot = FreeSlot(dungeon)
+  let week = CurrentUtcWeek()
+
+  ensures:
+    if live != null:
+      RejoinInstance(player, live)
+    else:
+      slot.party_key = DurableKey(player)
+      slot.difficulty = mythic
+      slot.status = claimed
+      DungeonRun.created(instance: slot, party: party, keystone: KeystoneOf(player, dungeon), keystone_level: floor, affixes: MythicAffixesForWeek(dungeon, week), boss_defeated: false, completed: false, wiped: false)
+}
+
+-- Mythic+ HP and damage compound a per-level factor on top of the dungeon's
+-- heroic tuning record; armor does not compound. Affixes activate at fixed
+-- thresholds (4, 7, 10), drawn from the per-week rotation seeded by utcWeek.
+rule MythicScalingAppliesPerLevel {
+  when: e: Mob.created
+  requires: e.spawn_instance.is_mythic
+  let level = KeystoneLevelOf(e.spawn_instance)
+  let factor = CompoundingFactor(MYTHIC_HP_DAMAGE_PER_LEVEL, level - 1)
+
+  ensures: e.hp = Round(e.hp * factor)
+  ensures: e.max_hp = Round(e.max_hp * factor)
+}
+
+rule MythicAffixesRotatePerUtcWeek {
+  when: UtcWeekChanged(new_week)
+  let count = MythicAffixCountFor(new_week)
+
+  for k in Keystone:
+    ensures: k.active_affixes = SeededSample(AllMythicAffixes(), count, SeedFrom(new_week))
+    ensures: k.week_seed = new_week
+}
+
+-- Untimed by design. Clearing level N sets best_cleared = max(best_cleared, N);
+-- wipes never lower the unlocked level, the run can be re-pulled.
+rule MythicClearAdvancesBestCleared {
+  when: run: DungeonRun.boss_defeated transitions_to true
+  requires: run.instance.is_mythic
+  let level = run.keystone_level
+
+  for member in run.party.members:
+    ensures: SetBestCleared(member, run.instance.dungeon, MaxOf(BestClearedOf(member, run.instance.dungeon), level))
+}
+
+-- End-of-run chest: personal loot per eligible contributor. The first 2 mythic
+-- clears per character per UTC day pay chest contents (one gear piece from a
+-- rotating slot band keyed off utcWeek); further clears still pay marks and
+-- advance best_cleared, so ladder pushing is never pointless. Chest quality
+-- scales with keystone level.
+rule MythicChestPaysFirstTwoClearsPerDay {
+  when: run: DungeonRun.boss_defeated transitions_to true
+  requires: run.instance.is_mythic
+  let recipients = CreditedParticipants(run)
+  let week = CurrentUtcWeek()
+
+  for meta in recipients where meta.mythic_chests_today < MYTHIC_CHEST_PAID_CLEARS_PER_DAY:
+    ensures: GrantChestLoot(meta, SlotBandFor(run.instance.dungeon, week))
+    ensures: meta.mythic_chests_today = meta.mythic_chests_today + 1
+}
+
+------------------------------------------------------------
+-- FORGED DROPS (PRD: docs/prd/mythic-plus-and-forged.md, section 4.4)
+-- Code path does not yet ship; rules distil the PRD roll contract.
+------------------------------------------------------------
+
+-- Every gear item dropped by a heroic final boss, the heroic bonus table, or a
+-- mythic+ chest rolls ONCE on the forge table at drop time. Tiers are
+-- exclusive per drop: roll Swiftforged first, else Valeforged, else base.
+-- Fixed Rng draw order (a parity scenario pins it).
+rule ForgeRollAtDropTime {
+  when: ItemDropped(item, recipient, source, keystone_level)
+  requires: ForgeEligibleSource(source)
+  let swift_chance = MinOf(FORGE_SWIFT_CAP, FORGE_SWIFT_CHANCE_HEROIC + FORGE_SWIFT_BONUS_PER_KEY * keystone_level)
+  let vale_chance = MinOf(FORGE_VALE_CAP, FORGE_VALE_CHANCE_HEROIC + FORGE_VALE_BONUS_PER_KEY * keystone_level)
+  let swift_hit = RngChance(swift_chance)
+  let vale_hit = RngChance(vale_chance)
+
+  ensures:
+    if swift_hit:
+      ForgedDrop.created(base_item: item, tier: swiftforged, move_speed_pct: RollSwiftMagnitude(keystone_level), bound_to: recipient)
+    else if vale_hit:
+      ForgedDrop.created(base_item: item, tier: valeforged, move_speed_pct: 0, bound_to: recipient)
+    else:
+      ForgedDrop.created(base_item: item, tier: base, move_speed_pct: 0, bound_to: recipient)
+}
+
+-- Speed does not stack. moveSpeedMult applies ONLY the single highest equipped
+-- Swiftforged bonus (the classic minor-speed-enchant rule). Two Swiftforged
+-- pieces are a re-gear choice, not an additive win. Valeforged stat gains
+-- stack normally (they are just stats).
+rule SwiftforgedSpeedBonusUsesSingleHighest {
+  when: RecalcMoveSpeed(player)
+  let bonuses = EquippedSwiftforgedBonuses(player)
+  let best = if bonuses.count > 0: MaxOf(bonuses) else: 0
+
+  ensures: player.move_speed_mult = 1 + best / 100
+}
+
+------------------------------------------------------------
+-- HEROIC QUARTERMASTER (MARKS VENDOR)
+------------------------------------------------------------
+
+-- The Heroic Quartermaster sells the game's only neck/ring jewelry for Heroic
+-- Marks (an inventory item, debited from the buyer's bags). Server re-validates
+-- proximity + marks balance + bag space.
+rule BuyFromHeroicQuartermaster {
+  when: BuyHeroicVendorItem(player, item)
+  requires: AtHeroicVendorNpc(player)
+  requires: not PlayerDead(player)
+  requires: HeroicMark{holder: player}.quantity >= PriceOf(item)
+  requires: CanAddItem(player, item, 1)
+
+  ensures: RemoveItem(player, HeroicMarkItemId(), PriceOf(item))
+  ensures: GrantItem(player, item, 1)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant InstanceDifficultyFixedForRunLife {
+  -- A claimed instance's difficulty never changes mid-run. A mid-run selection
+  -- flip (or a corpse-runner's ghost) rejoins the live claim instead of
+  -- stranding the player in a fresh parallel claim at the new difficulty.
+  for inst in Instance where inst.status != free:
+    inst.difficulty = OriginalDifficulty(inst)
+}
+
+invariant RaidRequiresRaidGroup {
+  -- Raid-required dungeons reject standard parties; raid-only dungeons reject
+  -- raid groups from standard dungeons.
+  for inst in Instance:
+    (inst.dungeon.raid_required implies PartyOf(inst.party_key).is_raid) and
+    (PartyOf(inst.party_key).is_raid implies inst.dungeon.raid_allowed)
+}
+
+invariant HeroicLockoutDifficultyScoped {
+  -- The :heroic lockout id is distinct from the normal lockout. One never
+  -- consumes the other; one normal AND one heroic Nythraxis kill per day.
+  for lock in HeroicLockout:
+    lock.dungeon.supports_difficulty.count >= 1
+}
+
+invariant AtMostOneLiveLockpickPerDelveRun {
+  -- Single-interactor lockpick per run. A second engage while one is
+  -- IN_PROGRESS is rejected at the door.
+  for run in DelveRun:
+    LiveLockpickCount(run) <= 1
+}
+
+invariant LockpickOutcomeConsumesChestAttempt {
+  -- SUCCESS and FAILED consume the chest attempt; ABANDONED preserves it.
+  -- A failed pick means re-clearing the whole delve is the only retry path.
+  for chest in DelveChest:
+    (chest.attempt_available = false) implies
+      (chest.looted or ExistsFailedAttempt(chest))
+}
+
+invariant LockpickClientNeverSeesFullBoard {
+  -- Server authority: the full LockpickBoard (open rows, gate columns, traps)
+  -- never serializes whole to a client. Only the fogged visibleCells() window
+  -- inside the preset's visibility_window is ever emitted.
+  for page in LockpickBoard:
+    SerializedToClient(page) = Subset(VisibleCells(page, page.preset.visibility_window))
+}
+
+invariant LockpickBoardAlwaysSolvable {
+  -- The generator carves a guaranteed solution path first, so an ante-1
+  -- (flawless) solve is always fair: every generated board is solvable by
+  -- construction, never by runtime assertion.
+  for page in LockpickBoard:
+    page.is_solvable = true
+}
+
+invariant ForgeTiersExclusivePerDrop {
+  -- A drop is at most one of base / valeforged / swiftforged. The roll draws
+  -- Swiftforged first, else Valeforged, else base; the tiers never combine.
+  for d in ForgedDrop:
+    d.tier = base or d.tier = valeforged or d.tier = swiftforged
+}
+
+invariant SwiftforgedSingleHighestEquipped {
+  -- The classic minor-speed-enchant rule: only the single highest equipped
+  -- Swiftforged bonus contributes to move speed. Stacking is forbidden.
+  for p in Player:
+    MoveSpeedMult(p) = 1 + HighestEquippedSwiftforged(p) / 100
+}
+
+invariant DelveAffixesAlwaysImplemented {
+  -- A Heroic delve rolls affixes only from the IMPLEMENTED pool (affixes with
+  -- a sim hook). An inert affix never displaces a real one on a live run.
+  for run in DelveRun where run.is_heroic:
+    run.affixes.all(a: a in ImplementedAffixes(run.delve.theme))
+}
+
+invariant DelveDailyMarkBudgetIsBounded {
+  -- First N clears/day pay full (2 Heroic / 1 Normal); after that Heroic
+  -- guarantees 1, Normal rolls. Mark income per day is bounded for both tiers.
+  for p in Player:
+    p.delve_daily.mark_clears <= TotalDelveClears(p, p.delve_daily.date)
+}
+
+invariant MythicLadderCannotBeSkipped {
+  -- Entry at min(best_cleared across party members) + 1. A friend can be
+  -- pulled up one level; the ladder itself can never be skipped.
+  for run in DungeonRun where run.instance.is_mythic:
+    run.keystone_level = MinBestCleared(run.party, run.instance.dungeon) + 1
+}
+
+invariant AllInstanceRandomnessThroughSeededRng {
+  -- Every instance spawn, delve module/affix/bountiful roll, lockpick page
+  -- generation, mark payout chance, copper roll, and forge roll draws from the
+  -- single shared Rng or a deterministic sub-stream derived from a stored
+  -- seed. Same seed + same input timing gives the same run byte for byte
+  -- across the offline sim, the authoritative server, and the headless env.
+  for run in DungeonRun:
+    run in RngDerived
+  for d in DelveRun:
+    d.seed in RngDerived
+}
+
+open question "Should the raid's heroic bonus loot also roll the forge table, or stay exempt until mythic+ ships? (PRD open question 1: current lean is exempt; the raid is the ceiling forged gear chases.)"
+open question "Chest slot-band tables: authored per dungeon, or one shared rotation with a per-dungeon offset? (PRD open question 2: current lean is one shared rotation.)"
+open question "Should a future season reset best_cleared? (PRD open question 3: out of scope for v1; the field is per-character.)"
+open question "The Nythraxis encounter script drives phase transitions internally; this spec models only the raid behavioural shell. Should finer per-phase mechanic gates (Soul Rend lockout, Deathless Rage wardstone channel) be promoted into this spec, or live in a raid-encounter spec of their own?"
+open question "Should the spec model the Drowned Litany rite and baptistry puzzle scripts explicitly, or keep them out of scope as delve-internal puzzles?"

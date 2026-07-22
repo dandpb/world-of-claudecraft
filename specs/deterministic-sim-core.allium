@@ -1,0 +1,288 @@
+-- allium: 3
+-- deterministic-sim-core.allium
+-- Scope: the fixed-step deterministic simulation core, its seeded-Rng contract, the entity lifecycle, and the one-sim-three-hosts boundary.
+-- Includes: the Sim world clock and 20 Hz tick heartbeat, the deterministic Rng contract, the Entity spawn/alive/dead/despawn lifecycle, the host-facing surface, and the determinism, purity, and authority invariants.
+-- Excludes: combat math, professions, items, loot, quests, dungeons, instancing, movement physics, AI, rendering, UI, networking, and persistence schema; each is its own spec.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A host drives the sim. The same sim core runs unchanged on three host kinds.
+entity Host {
+    kind: offline_client | authoritative_server | headless_env
+    can_decide_outcomes: Boolean
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Vec3 {
+    x: Integer
+    y: Integer
+    z: Integer
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract SeededRng {
+    next: (rng: Rng) -> Number
+
+    @invariant ReproducibleFromSeed
+        -- For equal seeds and equal draw counts, next() returns the same value.
+        -- The full world is reproducible from the seed plus the ordered input stream.
+
+    @invariant DrawOrderIsLoadBearing
+        -- One shared stream feeds every draw site, so reordering any work inside
+        -- a tick that draws from it forks the world even with the same seed.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Rng {
+    seed: Integer
+    draw_count: Integer
+    sim: Sim
+}
+
+entity Sim {
+    seed: Integer
+    time: Integer
+    tick_count: Integer
+    next_tick_at: Integer
+    next_id: Integer
+    status: running | stopped
+    entropy_only_via_rng: Boolean
+    free_of_host_apis: Boolean
+    rng: Rng with sim = this
+    roster: SimEntity with sim = this
+
+    transitions status {
+        running -> stopped
+        terminal: stopped
+    }
+}
+
+entity SimEntity {
+    id: Integer
+    kind: player | mob | npc | object
+    hp: Integer
+    max_hp: Integer
+    pos: Vec3
+    spawn_pos: Vec3
+    recycles_at: Integer
+    will_respawn: Boolean
+    sim: Sim
+    status: spawning | alive | dead | despawned
+
+    transitions status {
+        spawning -> alive
+        alive -> dead
+        dead -> alive
+        dead -> despawned
+        terminal: despawned
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    tick_rate: Integer = 20
+    dt_ms: Integer = 50
+    recycle_delay_ms: Integer = 60000
+}
+
+------------------------------------------------------------
+-- Surface
+------------------------------------------------------------
+
+surface RealmBootSurface {
+    facing host: Host
+
+    provides:
+        RealmBooted(host, seed)
+}
+
+surface SimSurface {
+    facing host: Host
+    context sim: Sim
+
+    exposes:
+        sim.time
+        sim.tick_count
+        sim.seed
+        sim.roster
+
+    provides:
+        StepTick(host, sim)
+            when sim.status = running
+        SubmitInput(host, sim)
+            when sim.status = running
+        DrainEvents(host, sim)
+            when sim.status = running
+        Spawn(host, sim, kind, pos, will_respawn)
+            when sim.status = running
+        DealDamage(host, sim, target, amount)
+            when sim.status = running
+        Shutdown(host, sim)
+            when sim.status = running
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule InitializeBootedSim {
+    when: RealmBooted(host, seed)
+    ensures:
+        let s = Sim.created(
+            seed: seed,
+            time: 0,
+            tick_count: 0,
+            next_tick_at: now,
+            next_id: 1,
+            status: running,
+            entropy_only_via_rng: true,
+            free_of_host_apis: true
+        )
+        s.status = running
+        Rng.created(seed: seed, draw_count: 0, sim: s)
+}
+
+rule ShutdownSim {
+    when: Shutdown(host, sim)
+    requires: sim.status = running
+    ensures:
+        sim.status = stopped
+}
+
+rule TickAdvances {
+    when: StepTick(host, sim)
+    requires: sim.status = running
+    ensures:
+        sim.next_tick_at = sim.next_tick_at + config.dt_ms
+        sim.time = sim.time + config.dt_ms
+        sim.tick_count = sim.tick_count + 1
+}
+
+rule SpawnEntity {
+    when: Spawn(host, sim, kind, pos, will_respawn)
+    requires: sim.status = running
+    let id = sim.next_id
+    ensures:
+        sim.next_id = sim.next_id + 1
+        SimEntity.created(
+            id: id,
+            kind: kind,
+            hp: 1,
+            max_hp: 1,
+            pos: pos,
+            spawn_pos: pos,
+            recycles_at: 0,
+            will_respawn: will_respawn,
+            sim: sim,
+            status: spawning
+        )
+}
+
+rule EntityActivates {
+    when: e: SimEntity.created
+    requires: e.status = spawning
+    ensures:
+        e.status = alive
+        e.hp = e.max_hp
+}
+
+rule ApplyDamage {
+    when: DealDamage(host, sim, e, amount)
+    requires: e.status = alive
+    let lethal = (e.hp - amount) <= 0
+    ensures:
+        if lethal:
+            e.hp = 0
+            e.status = dead
+            e.recycles_at = now + config.recycle_delay_ms
+        else:
+            e.hp = e.hp - amount
+}
+
+rule DeadEntityRecycles {
+    when: e: SimEntity.recycles_at <= now
+    requires: e.status = dead
+    ensures:
+        if e.will_respawn:
+            e.status = alive
+            e.hp = e.max_hp
+            e.pos = e.spawn_pos
+        else:
+            e.status = despawned
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SimTimeIsTickCountByDt {
+    for sim in Sim:
+        sim.time = sim.tick_count * config.dt_ms
+}
+
+invariant RngSeededFromSim {
+    for sim in Sim:
+        sim.rng.seed = sim.seed
+}
+
+invariant ReproducibleFromSeed {
+    for r in Rng:
+        r.seed = r.sim.seed
+}
+
+invariant DrawOrderIsLoadBearing {
+    for r in Rng:
+        r.draw_count >= 0
+}
+
+invariant DeadEntityHasZeroHp {
+    for e in SimEntity:
+        e.status = dead implies e.hp = 0
+}
+
+invariant LivingEntityHasPositiveHp {
+    for e in SimEntity:
+        e.status = alive implies e.hp > 0
+}
+
+invariant EntityIdsUnique {
+    for e1 in SimEntity:
+        for e2 in SimEntity:
+            e1 != e2 implies e1.id != e2.id
+}
+
+invariant SimUsesOnlySeededRng {
+    for sim in Sim:
+        sim.entropy_only_via_rng = true
+}
+
+invariant SimImportsNoHostFramework {
+    for sim in Sim:
+        sim.free_of_host_apis = true
+}
+
+invariant ServerIsAuthoritative {
+    for h in Host:
+        (h.kind = authoritative_server) = h.can_decide_outcomes
+}
+
+-- Determinism guarantee (stated for the requirements record; the predicates above
+-- pin its mechanical consequences): for any two Sims with equal seeds and equal
+-- ordered input streams, every draw from one's Rng equals the draw at the same
+-- count from the other's, and the resulting world states are identical. The Sim
+-- carries no DOM, browser, Three.js, Math.random, Date.now, or performance.now
+-- reachable from its logic; entropy and time come only from sim.rng and sim.time.

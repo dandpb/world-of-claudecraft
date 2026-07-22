@@ -1,0 +1,629 @@
+-- allium: 3
+-- rest-pipeline.allium
+-- Scope: the in-house REST request pipeline that resolves a typed RouteDef, runs a Koa-style middleware onion, enforces two-tier rate limiting and BOLA ownership, and emits every error as a typed RFC 9457-shaped problem detail drawn from an append-only code catalog, with a retained legacy ladder kept in dual-edit lockstep behind a one-flag dispatch switch.
+-- Includes: Request, Method, Surface, EnvelopeKind, ErrorCode, ProblemDetail, MatchResult, RateLimitOutcome, RateLimitPolicy, AuthorizeDecision value types; the Caller, Account, LegacyLadder, and PgGlobalStore external entities; the RouteDef, RouteRegistry, RateBucket, and Ctx entities; the Router, MiddlewareOnion, RateLimiter, ErrorEnvelope, and OwnershipGuard contracts; the ResolveRoute, DelegateUnmatchedToLegacy, RunMiddlewareChain, EnforceRateLimit, AuthorizeOwnership, EmitProblemOnError, SortRoutesBySpecificity, and RejectRouteShadowing rules; the RestRequestBoundary surface; the append-only catalog, every-error-is-a-typed-problem, exactly-one-response, flood-never-reaches-the-pg-backstop, player-owned-denial-is-anti-enumeration, owned-route-not-shadowed, most-specific-route-wins, and dual-edit-lockstep-until-ladder-deleted invariants.
+-- Excludes: individual endpoint behaviour (each route owns its own spec); auth identity content (the auth-accounts spec owns what an identity IS, this spec only models that an auth-context middleware ATTACHES it to the Ctx); HTTP wire bytes and framework internals; per-surface envelope serializers beyond their SHAPE (the SHAPE is the design decision, the bytes are not); caching, structured logging, and the metrics exporter internals; the retained legacy ladder's code (modelled only as a dispatch state, not reimplemented); the boot health probes (/livez, /readyz, /metrics); CORS, top-level security headers, and Turnstile (cross-cutting middleware not load-bearing for the pipeline contract); pagination, ETag, Deprecation/Sunset, and OpenAPI generation (deferred conventions, not yet built).
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- HTTP method token the route table dispatches on. HEAD and OPTIONS are never
+-- registered directly: HEAD is served as GET (with head=true on the match),
+-- OPTIONS is synthesized from the real method set for the path.
+enum Method {
+    GET
+    | POST
+    | PUT
+    | PATCH
+    | DELETE
+    | OPTIONS
+    | HEAD
+}
+
+-- The coarse dispatch family a route belongs to. Each surface maps to one
+-- default response envelope, and a single route may override its envelope via
+-- meta (a binary card inside api, an HTML unsubscribe page inside api). These
+-- mirror the prefix arms of the top-level dispatcher.
+enum Surface {
+    api
+    | oauth
+    | admin
+    | internal
+}
+
+-- The per-surface response envelope shape. The stable error code serializes
+-- THROUGH one of these; the envelope is the shape seam, not a code source.
+enum EnvelopeKind {
+    problem_json
+    | oauth
+    | admin
+    | html
+    | redirect
+    | binary
+    | legacy405
+}
+
+-- Whether an owned resource is player-owned or operator-scoped. Drives the
+-- BOLA denial shape and the registry-introspection coverage rule.
+enum OwnerScope {
+    account
+    | operator
+}
+
+-- How a rate-limit policy derives its key: per client IP, or per (IP AND
+-- account). An ip+account policy reads the caller's account id, so it must
+-- mount BEHIND the route's auth guard that populates the Ctx.
+enum RateLimitKeyClass {
+    ip
+    | ip_account
+}
+
+-- The dispatch mode read once at boot from the env flag. The DEFAULT is new;
+-- legacy is the one-flag rollback to the retained legacy ladder.
+enum DispatchMode {
+    new
+    | legacy
+}
+
+-- One match against the route table. The router writes nothing and chooses no
+-- envelope; it returns this discriminated outcome and lets the dispatcher and
+-- the error model own every write.
+enum MatchKind {
+    matched
+    | method_not_allowed
+    | options
+    | not_found
+}
+
+value MatchResult {
+    kind: MatchKind
+    route: RouteDef
+    params: Map<String, String>
+    head: Boolean
+    allow: Set<Method>
+}
+
+-- A stable, machine-readable `<domain>.<reason>` identifier from the catalog.
+-- The server emits the code; the client localizes it to the user's selected
+-- language. The English `detail` on a problem is a dev/curl aid only, never
+-- the source of truth.
+value ErrorCode {
+    code: String
+}
+
+-- The outcome of recording one rate-limit attempt, in either tier.
+value RateLimitOutcome {
+    allowed: Boolean
+    remaining: Integer
+    resetSeconds: Integer
+}
+
+-- A named rate-limit policy. The limit and window are the advertised quota
+-- (they DERIVE from the limiter's own named constant, never a re-typed
+-- literal); the key class drives the resolver; the tier2 flag selects the pg
+-- global backstop. The limiter fn and the tier-2 store are modelled as the
+-- decision to record against a RateBucket and a PgGlobalStore, not held here.
+value RateLimitPolicy {
+    name: String
+    keyClass: RateLimitKeyClass
+    limit: Integer
+    windowSeconds: Integer
+    tier2: String
+}
+
+-- The RFC 9457 problem-details SHAPE the api surface emits. The load-bearing
+-- field is the stable `code`; `params` carries structured values for the
+-- client to interpolate, never pre-formatted prose. `type`, `title`,
+-- `status`, `detail`, and `instance` are the RFC 9457 standard members; the
+-- code ALWAYS wins over an extension member of the same name.
+value ProblemDetail {
+    type: String
+    title: String
+    status: Integer
+    detail: String
+    instance: String
+    code: ErrorCode
+    params: Map<String, String>
+}
+
+-- The BOLA loader's decision: an authorized row stashed on the Ctx, or a miss
+-- whose response shape is the route's OwnerScope decision.
+enum AuthorizeKind {
+    authorized
+    | denied
+}
+
+value AuthorizeDecision {
+    kind: AuthorizeKind
+    scope: OwnerScope
+    row: Opaque
+}
+
+-- A serialized response ready to write. Returned by the error envelope seam;
+-- the error middleware owns the write. Modelled opaquely: the load-bearing
+-- fact is that every error path produces one of these carrying a code.
+value SerializedResponse {
+    status: Integer
+    body: String
+    code: ErrorCode
+}
+
+-- An opaque value the pipeline does not introspect: the parsed body, a loaded
+-- row, or a thrown value. Carried through the Ctx and the error normalizer
+-- without the spec naming its shape.
+value Opaque {
+    payload: String
+}
+
+-- The incoming REST request, abstracted off raw node:http. The pipeline reads
+-- the frozen Ctx built from this, never the raw req/res, which is what keeps
+-- the route core testable and usable from both REST and WS.
+value Request {
+    method: Method
+    path: String
+    ip: String
+    headers: Map<String, String>
+    body: String
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The HTTP client that issues requests and receives problem responses. The
+-- pipeline trusts NOTHING from the caller: every outcome resolves inside the
+-- server, the client only renders the localized code.
+entity Caller {
+    ip: String
+    account: Account
+}
+
+-- The authenticated identity attached to the Ctx after the auth-context
+-- middleware runs. This spec only models THAT identity is attached (and that
+-- an ip+account limiter and an ownership loader read it); what an identity
+-- IS, its scopes, and its moderation state belong to the auth-accounts spec.
+entity Account {
+    id: Integer
+}
+
+-- The retained legacy if-ladder kept behind the dispatch flag for rollback.
+-- A migrated route lives in BOTH the registry and this ladder; the parity
+-- harness proves they emit byte-identical responses. Deleted only after the
+-- release-recorded exit criteria are met, never before.
+entity LegacyLadder {
+    retained: Boolean
+}
+
+-- The cross-realm Postgres backing store for the tier-2 rate limit. Tier-2 is
+-- a durability backstop keyed GLOBALLY so auth limits survive restart and do
+-- not multiply across realm processes. Any store error FAILS OPEN: a pg
+-- outage degrades to tier-1-only limiting, never a 500 and never a block.
+entity PgGlobalStore {
+    reachable: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One route in the table. The handler is req/res-free (takes the Ctx) so the
+-- same core serves REST and WS and is unit-testable. The middleware slot is a
+-- Koa-style onion composed after the global frames; meta carries the BOLA and
+-- envelope markers.
+entity RouteDef {
+    method: Method
+    path: String
+    surface: Surface
+    envelope: EnvelopeKind
+    requireOwnedKind: String
+    requireOwnedScope: OwnerScope
+    publicRead: Boolean
+}
+
+-- The assembled route lookup the dispatcher queries per request. Owns the
+-- most-specific-first sort order and the BOLA-shadow build-time guard; the
+-- underlying match primitive is the Router contract.
+entity RouteRegistry {
+    routes: Set<RouteDef>
+    sorted: Boolean
+    bola_guard_run: Boolean
+}
+
+-- A tier-1 in-memory rate bucket, per-realm. This is the cheap pre-DB gate
+-- that rejects floods before any DB work. The tier-2 pg backstop is modelled
+-- as the decision to record against PgGlobalStore, not as a separate bucket
+-- entity (it is a fixed-window counter on a row, not a held window).
+entity RateBucket {
+    policy: String
+    key: String
+    count: Integer
+    reset_at: Timestamp
+    last_outcome: RateLimitOutcome
+
+    transitions status {
+        open -> exhausted
+        exhausted -> open
+    }
+}
+
+-- The per-request context. Built frozen from the request and the match; the
+-- handler reads and writes it instead of touching raw req/res. The auth
+-- middleware populates `account`; the ownership loader stashes the authorized
+-- row on `state`; the rate-limit middleware reads the key fields off it.
+entity Ctx {
+    req: Request
+    route: String
+    match: MatchResult
+    params: Map<String, String>
+    ip: String
+    account: Account
+    body: Opaque
+    state: Map<String, Opaque>
+    response: SerializedResponse
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    DEFAULT_DISPATCH: DispatchMode = new
+    RATE_WINDOW_SECONDS: Integer = 60
+    PUBLIC_PATH_FALLBACK_STATUS: Integer = 404
+    STRUCTURAL_FALLBACK_STATUS: Integer = 500
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- Route resolution: pure decision over the assembled table. Writes nothing,
+-- runs no middleware, chooses no envelope. Returns a small discriminated
+-- MatchResult: a matched route with captured params, a method-not-allowed
+-- with the Allow set, a synthesized options, or a not-found. Static patterns
+-- beat dynamic ones at the same position; the registry owns the specificity
+-- order the router deliberately leaves to it.
+contract Router {
+    resolve: (registry: RouteRegistry, method: Method, path: String) -> MatchResult
+
+    @invariant MostSpecificRouteWins
+        -- The registry sorts routes most-specific-first (more leading literal
+        -- segments, then more literals, then fewer params, then registration
+        -- order) before the router is built, so an overlapping dynamic route
+        -- resolves to the more specific one.
+
+    @invariant OwnedRouteNotShadowed
+        -- A build-time guard rejects any account-owned :id route left
+        -- interceptable by an earlier, non-owned, different-shape dynamic
+        -- route that runs no ownership loader (a BOLA hole the sort cannot
+        -- save). The build fails rather than shipping the hole.
+}
+
+-- The middleware onion. The stack runs in order; each frame that awaits next
+-- unwinds in reverse. runOnion is the OUTERMOST wrapper and the sole response
+-- authority: it guarantees EXACTLY ONE idempotent response on both the
+-- resolve path (a structural no-response fallback) and the throw path (a
+-- bare, detail-free fallback). A double next() in one frame is rejected.
+contract MiddlewareOnion {
+    run: (ctx: Ctx, stack: List<Opaque>) -> SerializedResponse
+
+    @invariant ExactlyOneResponsePerRequest
+        -- Every request ends with exactly one response, never zero (a
+        -- misbehaving stack gets a structural fallback) and never two (an
+        -- already-committed response makes the fallback a no-op). The socket
+        -- is never left hanging.
+
+    @invariant StructuralFallbackLeaksNothing
+        -- The outermost throw-path fallback sends a bare status with NO body.
+        -- The thrown value is never read or serialized, so no stack, SQL,
+        -- table, or message can leak through the net. The real RFC 9457
+        -- mapping lives INSIDE this wrapper, in the error contract.
+}
+
+-- Two-tier rate limiting. Tier-1 (in-process sliding window) runs FIRST; on a
+-- tier-1 rejection the 429 throws WITHOUT touching tier-2 (a flood must
+-- never reach pg, this ordering is an invariant). Tier-2 records the global
+-- counter ONLY when tier-1 allows, and FAILS OPEN on any store error.
+contract RateLimiter {
+    record: (policy: RateLimitPolicy, ctx: Ctx, bucket: RateBucket, store: PgGlobalStore) -> RateLimitOutcome
+
+    @invariant FloodNeverReachesPgBackstop
+        -- Tier-1 rejects before tier-2 is consulted. A request that fails
+        -- tier-1 NEVER triggers a tier-2 store write, so a flood is absorbed
+        -- by the in-memory gate and pg sees only the subset tier-1 allows.
+
+    @invariant Tier2FailsOpen
+        -- A tier-2 (pg) store error degrades to tier-1-only limiting. It
+        -- never produces a 500 on the route and never blocks traffic the
+        -- in-memory gate allowed.
+}
+
+-- The error envelope seam. Normalizes ANY thrown value to a stable code plus
+-- the code-implied headers, then serializes for the route's surface. The api
+-- surface uses problem+json; oauth keeps RFC 6749; admin keeps its frozen
+-- envelope; a route may override the surface default via meta. RETURNS the
+-- serialized shape; the error middleware writes it.
+contract ErrorEnvelope {
+    serialize: (err: Opaque, ctx: Ctx, surface: EnvelopeKind) -> SerializedResponse
+
+    @invariant EveryErrorIsTypedProblem
+        -- Every error response carries a stable ErrorCode from the catalog.
+        -- No raw English prose is ever shown to a user; the English `detail`
+        -- is a dev/curl aid the client ignores. An unexpected throwable maps
+        -- to a generic internal-error code whose body is built from the code
+        -- and generic text only, so nothing internal (stack, SQL, table,
+        -- column, driver detail) leaks.
+
+    @invariant ProblemShapePreservesReservedMembers
+        -- Extension params spread into the problem body can NEVER shadow the
+        -- RFC 9457 reserved members (type, title, status, detail, instance,
+        -- code). The code in particular always wins.
+}
+
+-- BOLA load-then-authorize. Runs AFTER the auth guard. Decodes the :id
+-- param before any DB call (a non-numeric id is rejected as a validation
+-- failure, never sent to a query as NaN), then calls the ACCOUNT-SCOPED
+-- loader. A hit stashes the row on the Ctx for the handler; a miss is
+-- indistinguishable from not-owned by construction (the loader is account
+-- scoped), and the denial shape is the route's OwnerScope decision.
+contract OwnershipGuard {
+    authorize: (ctx: Ctx, kind: String, scope: OwnerScope) -> AuthorizeDecision
+
+    @invariant PlayerOwnedDenialIsAntiEnumeration
+        -- An account-scoped resource denial is a NOT-FOUND, not a FORBIDDEN,
+        -- so a caller cannot tell "exists but not yours" apart from "does not
+        -- exist". An operator-scoped resource denial IS a forbidden (the
+        -- operator surface enumerates differently).
+
+    @invariant BolaDenialLogsNoCrossAccountSignal
+        -- A BOLA deny-log carries ONLY the caller's own account id and the id
+        -- the caller requested (their own request). It NEVER records whether
+        -- the row exists for another account, because the account-scoped
+        -- loader was never asked, so the log cannot leak a cross-account
+        -- existence signal.
+}
+
+------------------------------------------------------------
+-- Surface
+------------------------------------------------------------
+
+-- The request boundary every REST surface enters. The caller is untrusted:
+-- the pipeline resolves every outcome inside the server and returns only a
+-- code the client re-localizes. Identity is attached by the auth-context
+-- middleware inside the chain; this spec does not model what that identity is.
+surface RestRequestBoundary {
+    facing caller: Caller
+
+    context registry: RouteRegistry
+    context legacy: LegacyLadder
+
+    exposes:
+        registry.routes
+
+    provides:
+        ReceiveRequest(caller, req)
+        DelegateUnmatchedToLegacy(legacy, req)
+        RunMiddlewareChain(ctx, route)
+        EnforceRateLimit(ctx, policy)
+        AuthorizeOwnership(ctx, kind, scope)
+        ThrowProblem(code, ctx, params)
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A request enters the pipeline. It is resolved against the registry; an
+-- unmatched path (and a HEAD request, while the legacy arms are retained) is
+-- delegated to the legacy ladder UNCHANGED, so a migrated route stays
+-- byte-identical old-vs-new and the parity harness holds. A matched route
+-- runs the middleware onion.
+rule ResolveRoute {
+    when: ReceiveRequest(caller, req)
+    let registry = ActiveRegistry()
+    let result = ResolveMatch(registry, req.method, req.path)
+    if result.kind = matched and not result.head:
+        let ctx = BuildContext(req, result)
+        ensures: RunMiddlewareChain(ctx, result.route)
+    else:
+        ensures: DelegateUnmatchedToLegacy(ActiveLegacyLadder(), req)
+}
+
+-- The matched route runs its ordered chain: the global frames (error map,
+-- metric observation, origin and content-type gates) first, then the route's
+-- own local frames (body parse, the require_* auth guards, turnstile, the
+-- per-policy rate limit, the ownership loader), then the handler. The chain
+-- unwinds in reverse. runOnion owns the single response.
+rule RunMiddlewareChain {
+    when: RunMiddlewareChain(ctx, route)
+    let stack = GlobalFrames(route) + route.middleware + HandlerFrame(route)
+    requires: stack.count > 0
+    ensures: ChainExecuted(ctx, stack)
+}
+
+-- Enforce a rate-limit policy on the route. Tier-1 (in-memory RateBucket) is
+-- consulted first; a tier-1 rejection throws the coded rate-limit-exceeded
+-- problem WITHOUT touching tier-2. If tier-1 allows and the policy is global,
+-- the PgGlobalStore records the global counter; a tier-2 rejection throws the
+-- coded problem with the tier-2 numbers; a tier-2 store error fails open.
+rule EnforceRateLimit {
+    when: EnforceRateLimit(ctx, policy)
+    let bucket = Tier1Bucket(policy, ctx)
+    let t1 = Tier1Record(bucket)
+    if not t1.allowed:
+        ensures: RateLimitHitRecorded(policy.name, policy.keyClass)
+        ensures: ThrowProblem(rate_limit_exceeded, ctx, { retryAfterSeconds: t1.resetSeconds })
+    else:
+        if policy.tier2 = global and Tier2StoreWired():
+            let store = ActivePgGlobalStore()
+            let t2 = Tier2Record(store, policy, ctx)
+            if Tier2StoreError(t2):
+                ensures: Tier2FailedOpen(policy)
+            else:
+                if not t2.allowed:
+                    ensures: RateLimitHitRecorded(policy.name, policy.keyClass)
+                    ensures: ThrowProblem(rate_limit_exceeded, ctx, { retryAfterSeconds: t2.resetSeconds })
+        ensures: ContinueChain(ctx)
+}
+
+-- Authorize an owned :id resource before the handler runs. A non-numeric id
+-- throws a validation failure before any DB call. The account-scoped loader
+-- either returns an authorized row (stashed on the Ctx) or a miss; a miss
+-- emits a structured bola_denied signal and answers the route's denial shape
+-- (anti-enumeration not-found for player-owned, forbidden for operator).
+rule AuthorizeOwnership {
+    when: AuthorizeOwnership(ctx, kind, scope)
+    requires: ctx.account != null
+    let id = DecodeOwnedId(ctx)
+    if not id.ok:
+        ensures: ThrowProblem(validation_failed, ctx, { issues: id.issues })
+    else:
+        let row = AccountScopedLoad(ctx.account, kind, id.value)
+        if row = null:
+            ensures: BolaDeniedEmitted(kind, ctx.route, ctx.account, id.value)
+            if scope = account:
+                ensures: RespondWithNotFound(ctx)
+            else:
+                ensures: RespondWithForbidden(ctx)
+        else:
+            ensures: ctx.state.set(kind, row)
+            ensures: ContinueChain(ctx)
+}
+
+-- Any throw that escapes a frame is normalized and serialized through the
+-- route's surface envelope. A deliberate typed throw passes its code through;
+-- a malformed-JSON throw maps to json_malformed; a decode failure maps to
+-- validation_failed; a unique-violation maps to db_conflict; anything else
+-- maps to internal_error and routes the ORIGINAL error to the unexpected sink
+-- (server-side only, never into the body).
+rule EmitProblemOnError {
+    when: ThrowCaught(err, ctx, surface)
+    let app = NormalizeToAppError(err)
+    let problem = ProblemDetail{
+        type: BlankType(),
+        title: ReasonFor(app.status),
+        status: app.status,
+        detail: DetailFor(app.code),
+        instance: ctx.req.path,
+        code: app.code,
+        params: app.params
+    }
+    if app.unexpected:
+        ensures: RouteOriginalToUnexpectedSink(err)
+    ensures: ProblemEmitted(ctx, problem, surface)
+}
+
+-- The registry assembles per-domain route tables into one flat list, sorts
+-- it most-specific-first, runs the BOLA-shadow guard, then builds the router.
+-- The sort is what makes an overlapping dynamic route resolve to the more
+-- specific one; the guard fails the build for any BOLA hole the sort cannot
+-- save.
+rule SortRoutesBySpecificity {
+    when: BuildRegistry(rawRoutes)
+    let sorted = SortBy(rawRoutes, SpecificityKey)
+    requires: NoShapeDuplicate(sorted)
+    ensures: RouteRegistry.created(routes = sorted, sorted = true, bola_guard_run = true)
+}
+
+-- A BOLA-shadow build-time guard. For every account-owned dynamic :id route,
+-- no EARLIER dynamic route of a different shape, the same method, and no
+-- ownership loader may overlap it in the final order. Such an earlier route
+-- would match the owned paths first and skip the ownership loader. The build
+-- fails rather than shipping the hole.
+rule RejectRouteShadowing {
+    when: BuildRegistry(rawRoutes)
+    let sorted = SortBy(rawRoutes, SpecificityKey)
+    for owned in sorted where IsAccountOwned(owned) and not IsStatic(owned):
+        for earlier in sorted where RegisteredBefore(earlier, owned):
+            requires: not (earlier.method = owned.method and not IsStatic(earlier) and not HasOwnershipLoader(earlier) and DifferentShape(earlier, owned) and PatternsOverlap(earlier, owned))
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The error-code catalog is APPEND-ONLY. Codes are permanent `<domain>.<reason>`
+-- identifiers with frozen param KEYS. Never renumber, rename, or remove one;
+-- only ADD. A rename silently breaks the client matcher and every persisted
+-- reference in every language at once.
+invariant ErrorCodesAppendOnly {
+    for c in ErrorCode:
+        StableForever(c.code)
+    for c in ErrorCode:
+        ParamKeysOnlyGrow(c.code)
+}
+
+-- Every error that leaves the pipeline is a typed problem detail carrying a
+-- stable ErrorCode from the catalog. No raw English prose is ever shown to a
+-- user; the English `detail` is a dev/curl aid the client ignores. The
+-- server stays language-agnostic; the client localizes by code.
+invariant EveryErrorIsTypedProblem {
+    for p in ProblemDetail:
+        p.code in ErrorCode
+}
+
+-- Exactly one response per request. Never zero (the structural fallback
+-- answers a misbehaving stack), never two (an already-committed response
+-- makes the fallback a no-op). The socket is never left hanging.
+invariant ExactlyOneResponsePerRequest {
+    for ctx in Ctx:
+        ResponseCount(ctx) = 1
+}
+
+-- Tier-1 (in-memory) rejects before tier-2 (pg) is consulted. A request that
+-- fails tier-1 NEVER triggers a tier-2 store write, so a flood is absorbed by
+-- the in-memory gate and the pg backstop sees only the subset tier-1 allows.
+invariant FloodNeverReachesPgBackstop {
+    for p in RateLimitPolicy:
+        Tier1Rejected(p) implies not Tier2Consulted(p)
+}
+
+-- A player-owned (account-scoped) resource denial is a NOT-FOUND, never a
+-- FORBIDDEN, so a caller cannot distinguish "exists but not yours" from "does
+-- not exist". An operator-scoped denial IS a forbidden. The account-scoped
+-- loader was never asked about another account, so neither the response nor
+-- the deny-log can leak a cross-account existence signal.
+invariant PlayerOwnedDenialIsAntiEnumeration {
+    for d in AuthorizeDecision where d.scope = account and d.kind = denied:
+        DenialResponse(d).kind = not_found
+    for d in AuthorizeDecision where d.scope = operator and d.kind = denied:
+        DenialResponse(d).kind = forbidden
+}
+
+-- The BOLA-shadow build-time guard keeps any account-owned :id route from
+-- being intercepted by an earlier, non-owned, different-shape dynamic route
+-- that runs no ownership loader. The build fails rather than shipping the
+-- hole; the sort normally orders the owned route first, the guard catches
+-- what the sort cannot.
+invariant OwnedRouteNotShadowed {
+    for reg in RouteRegistry:
+        reg.bola_guard_run = true
+    for owned in RouteDef where IsAccountOwned(owned) and not IsStatic(owned):
+        not ExistsEarlierNonOwnedOverlap(owned)
+}
+
+-- Overlapping dynamic routes resolve to the more specific one. The router
+-- itself has no specificity tiebreak (it matches dynamic patterns in
+-- registration order), so the registry sorts most-specific-first before the
+-- router is built. Static patterns beat dynamic ones at the same position
+-- because the router consults the static map before any dynamic list.
+invariant MostSpecificRouteWins {
+    for reg in RouteRegistry:
+        reg.sorted = true
+    for a in RouteDef:
+        for b in RouteDef where a.method = b.method and PatternsOverlap(a, b):
+            MoreSpecific(resolve_winner(a, b)) = resolve_winner(a, b)
+}
+
+-- A migrated route lives in BOTH the registry and the retained legacy ladder.
+-- Until the ladder is deleted, any behaviour edit to one twin MUST land in
+-- the other in the same change; an INTENTIONAL divergence is ledgered as a
+-- known deviation the parity harness filters exactly. The obligation expires
+-- when the release-recorded exit criteria are met and the ladder is deleted.
+invariant DualEditLockstepUntilLadderDeleted {
+    for r in RouteDef where Migrated(r):
+        LegacyLadder.retained = true implies ServedByBothArms(r)
+    for r in RouteDef where Migrated(r):
+        BehaviourEdit(r) implies EditLandedInBothArms(r)
+}

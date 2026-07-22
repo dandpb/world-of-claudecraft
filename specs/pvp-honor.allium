@@ -1,0 +1,1034 @@
+-- allium: 3
+-- pvp-honor.allium
+-- Scope: player-vs-player hostility flagging, the Honor currency with anti-farm diminishing returns, ranked Arena and unranked Fiesta/Vale-Cup bouts, and the Frostreach Frontier open-PvP zone plus its staked-seasons layer.
+-- Includes: the multi-source PvP flag (duel, arena, jail, frontier band, seasonal event), honorable-kill and arena-win honor grants with per-pair and per-day diminishing returns, arena queue/matchmake/resolve with Elo rating, the unranked party bouts (Fiesta, Vale Cup), the Frontier team assignment and cargo-extraction loop, and the token firewall that keeps the $WOC staked layer outside the sim purity boundary.
+-- Excludes: crowd-control diminishing returns (combat spec), bank and currency storage (economy spec), guild mechanics (social spec), duel duel-state internals beyond its hostility contribution, PvE damage math, rating-to-stat conversion beyond the multiplier formula.
+
+------------------------------------------------------------
+-- Config (constants the code and PRD encode)
+------------------------------------------------------------
+
+config {
+    -- Honor grant floor per source (frontier-pvp-honor PRD section 7.1; honor.ts constants).
+    honor_kill_base: Integer = 20
+    honor_assist: Integer = 5
+    honor_turnin_common: Integer = 2
+    honor_turnin_uncommon: Integer = 5
+    honor_turnin_relic: Integer = 25
+    honor_rare_participation: Integer = 15
+    honor_world_boss_participation: Integer = 100
+    honor_event_participation_min: Integer = 10
+    honor_event_participation_max: Integer = 50
+    honor_team_score_hourly_payout: Integer = 25
+
+    -- Ranked arena win honor by format (honor.ts RANKED_ARENA_WIN_HONOR).
+    honor_arena_win_1v1: Integer = 25
+    honor_arena_win_2v2: Integer = 50
+
+    -- Unranked Fiesta honor (honor.ts FIESTA_* constants).
+    honor_fiesta_kill: Integer = 20
+    honor_fiesta_completion: Integer = 20
+    honor_fiesta_win_bonus: Integer = 40
+
+    -- Per-pair diminishing-returns ladder (honor.ts HONOR_REPEAT_DR): full, half, quarter, zero.
+    honor_dr_full: Decimal = 1.0
+    honor_dr_half: Decimal = 0.5
+    honor_dr_quarter: Decimal = 0.25
+    honor_dr_zero: Decimal = 0.0
+    honor_dr_max_stage: Integer = 3
+
+    -- Arena win-vs-same-opponent DR ladder (honor.ts ARENA_REPEAT_DR): first win pays, repeats pay zero.
+    arena_dr_first: Decimal = 1.0
+    arena_dr_repeat: Decimal = 0.0
+
+    -- Arena daily taper by total wins the same UTC day (honor.ts arenaDailyMultiplier).
+    arena_daily_taper_start: Integer = 10
+    arena_daily_taper_floor_start: Integer = 15
+    arena_daily_taper_full: Decimal = 1.0
+    arena_daily_taper_half: Decimal = 0.5
+    arena_daily_taper_floor: Decimal = 0.25
+
+    -- Per-pair honor reset window (frontier-pvp-honor PRD section 7.1: resets hourly).
+    honor_pair_reset_window: Duration = 3600.seconds
+
+    -- Arena Elo constants (arena.ts).
+    arena_base_rating: Integer = 1500
+    arena_min_rating: Integer = 100
+    arena_k_factor: Integer = 32
+    arena_countdown: Duration = 5.seconds
+    arena_return_delay: Duration = 5.seconds
+    arena_max_duration: Duration = 150.seconds
+    arena_stall_hp_fraction_deadlock: Decimal = 0.02
+
+    -- Unranked bout tuning (fiesta.ts).
+    fiesta_score_limit: Integer = 15
+    fiesta_max_duration: Duration = 360.seconds
+    fiesta_standard_level: Integer = 20
+
+    -- PvP rating to damage fraction (power.ts). 10 rating per pct, hard cap 20%.
+    pvp_rating_per_pct: Integer = 10
+    pvp_offense_cap: Decimal = 0.2
+    pvp_defense_cap: Decimal = 0.2
+
+    -- Frontier zone (frontier-pvp-honor PRD section 5/6).
+    frontier_min_level: Integer = 15
+    frontier_staked_min_level: Integer = 20
+    frontier_cargo_capacity: Integer = 10
+    frontier_cargo_satchel_ttl: Duration = 60.seconds
+    frontier_leave_channel: Duration = 10.seconds
+    frontier_team_balance_tolerance: Integer = 2
+    frontier_hourly_event_period: Duration = 3600.seconds
+
+    -- Staked seasons (frontier-pvp-honor PRD section 12).
+    frontier_season_default_length: Duration = 1209600.seconds
+    frontier_event_announcement_lead: Duration = 300.seconds
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum PvPSource {
+    duel
+    | arena_match
+    | jail_brawl
+    | frontier_zone
+    | seasonal_event
+}
+
+enum FrontierTeam {
+    azure
+    | crimson
+}
+
+enum ArenaFormat {
+    ranked_1v1
+    | ranked_2v2
+    | fiesta_2v2
+    | yumi_3v3
+    | yumi_5v5
+    | vale_cup
+}
+
+enum ArenaPhase {
+    countdown
+    | active
+    | over
+}
+
+enum ArenaResolution {
+    defeat
+    | timeout
+    | forfeit
+    | abandoned
+}
+
+enum BoutResult {
+    win
+    | loss
+    | draw
+}
+
+enum HonorReason {
+    honorable_kill
+    | arena_win
+    | fiesta_kill
+    | fiesta_complete
+    | fiesta_win
+    | turn_in
+    | rare_participation
+    | world_boss
+    | event_participation
+    | team_score_hourly
+}
+
+enum FrontierSeasonMode {
+    free
+    | staked
+}
+
+enum FrontierSeasonPhase {
+    scheduled
+    | open
+    | settling
+    | closed
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A player character. Honor and ratings are plain additive counters on the
+-- character; the PvpFlag set is the live hostility surface isHostileTo reads.
+entity Character {
+    level: Integer
+    -- Honor is a soulbound currency: spendable and lifetime move together.
+    honor: Integer
+    lifetime_honor: Integer
+    frontier_team: FrontierTeam
+    arena_rating_1v1: Integer
+    arena_rating_2v2: Integer
+    arena_wins_1v1: Integer
+    arena_losses_1v1: Integer
+    arena_wins_2v2: Integer
+    arena_losses_2v2: Integer
+    cargo_load: Integer
+    jailed: Boolean
+    gm: Boolean
+
+    flags: Set<PvPFlag>
+    dr_pairs: Set<HonorDiminishingReturn>
+    arena_daily: ArenaDailyWindow
+    frontier_membership: FrontierMembership
+
+    is_queued_arena: Boolean
+    is_in_frontier_band: Boolean
+    is_staked_eligible: Boolean
+    -- Team is permanent per character once assigned (PRD 5.1).
+    team_assigned: frontier_team != null
+}
+
+-- One active source of PvP hostility on a character. isHostileTo between two
+-- characters is the disjunction of compatible flags (same duel, cross teams in
+-- the same arena match, both jailed, opposing frontier teams in band, cross
+-- teams in a live seasonal event). The flag lives only while its source is live.
+entity PvPFlag {
+    bearer: Character
+    source: PvPSource
+    -- Arena match this flag is bound to (null for non-arena sources).
+    match: ArenaMatch
+    -- Frontier team the bearer is representing while this flag is live.
+    team: FrontierTeam
+    -- Seasonal event instance this flag is bound to.
+    event: SeasonalEvent
+
+    is_live: true
+}
+
+-- An honorable-kill attribution: the killing-blow player plus the victim at the
+-- moment of death. The unit of honor anti-farm accounting is the
+-- (killer, victim) pair over a rolling window.
+entity HonorKill {
+    killer: Character
+    victim: Character
+    at: Timestamp
+    reason: HonorReason
+    -- Base honor before DR and level gating, computed from victim level.
+    base_honor: Integer
+    level_factor: Decimal
+    pair_stage_before: Integer
+    pair_stage_after: Integer
+    multiplier_applied: Decimal
+    honor_granted: Integer
+
+    is_zero_due_to_dr: multiplier_applied = config.honor_dr_zero
+    is_zero_due_to_level: level_factor = 0
+}
+
+-- Per-(killer, victim) diminishing-return state. Stage advances on each kill;
+-- resets to zero after the rolling window elapses with no further kill (PRD 7.1).
+entity HonorDiminishingReturn {
+    killer: Character
+    victim: Character
+    stage: Integer
+    first_kill_at: Timestamp
+    last_kill_at: Timestamp
+
+    is_reset: now - last_kill_at >= config.honor_pair_reset_window
+}
+
+-- Per-character UTC-daily arena window: repeat-win tracking by opponent team
+-- identity plus a total-wins taper. Rolled over to empty at the UTC day boundary.
+entity ArenaDailyWindow {
+    character: Character
+    utc_day: String
+    total_wins: Integer
+    wins_by_opponent: Set<OpponentWinCount>
+    fiesta_completions_by_opponent: Set<OpponentCompletionCount>
+
+    is_current: utc_day = TodayUtc()
+}
+
+entity OpponentWinCount {
+    window: ArenaDailyWindow
+    opponent_key: String
+    count: Integer
+}
+
+entity OpponentCompletionCount {
+    window: ArenaDailyWindow
+    opponent_key: String
+    count: Integer
+}
+
+-- A queued solo or premade unit seeking an arena bout. Format + rating drive
+-- matchmaking; the premade membership is what team-formation reads.
+entity ArenaTeam {
+    format: ArenaFormat
+    members: Set<Character>
+    rating_snapshot: Integer
+    queue_joined_at: Timestamp
+
+    is_premade: members.count >= 2
+    is_solo: members.count = 1
+}
+
+-- A formed bout: two teams, a phase machine, rating snapshots for Elo, and an
+-- optional unranked-mode payload (Fiesta state, Vale Cup match, Yumi match).
+entity ArenaMatch {
+    id: Integer
+    format: ArenaFormat
+    team_a: ArenaTeam
+    team_b: ArenaTeam
+    rating_a_before: Integer
+    rating_b_before: Integer
+    honor_team_a_key: String
+    honor_team_b_key: String
+    phase: ArenaPhase
+    resolution: ArenaResolution
+    winner: FrontierTeam
+    countdown_started_at: Timestamp
+    active_started_at: Timestamp
+    ended_at: Timestamp
+    result_recorded: Boolean
+    is_unranked: format = ArenaFormat.fiesta_2v2 or format = ArenaFormat.yumi_3v3 or format = ArenaFormat.yumi_5v5 or format = ArenaFormat.vale_cup
+    is_practice_bot_match: Boolean
+
+    transitions phase {
+        countdown -> active
+        active -> over
+        terminal: over
+    }
+}
+
+-- An Elo rating delta applied to every member of one team at bout resolution.
+entity ArenaRatingChange {
+    match: ArenaMatch
+    team: ArenaTeam
+    delta: Integer
+    rating_before: Integer
+    rating_after: Integer
+    result: BoutResult
+}
+
+-- A timed seasonal event that suspends normal team rules inside a bounded
+-- instance (Vale Cup boarball, Protect Yumi escort). Cross-team hostility is
+-- live only while the event phase is active or golden.
+entity SeasonalEvent {
+    kind: ArenaFormat
+    phase: ArenaPhase
+    team_a: ArenaTeam
+    team_b: ArenaTeam
+
+    transitions phase {
+        countdown -> active
+        active -> over
+        terminal: over
+    }
+}
+
+-- A Frontier membership: a character's presence in the Frontier zone, their
+-- team, and the cargo they currently carry. The team assignment is permanent
+-- per character; the presence is not.
+entity FrontierMembership {
+    character: Character
+    team: FrontierTeam
+    cargo: Set<CargoUnit>
+    entered_at: Timestamp
+    -- In staked seasons only: the bracket the character's deposit placed them in.
+    bracket: FrontierBracket
+
+    is_in_zone: entered_at != null
+}
+
+entity CargoUnit {
+    tier: CargoTier
+    holder: FrontierMembership
+}
+
+-- A dropped cargo satchel at a Frontier death: world entity lootable by the
+-- opposing team only, for a bounded TTL, then despawns (PRD 6.3).
+entity CargoSatchel {
+    at: Timestamp
+    ttl: Duration
+    lootable_by: FrontierTeam
+    contents: Set<CargoUnit>
+}
+
+enum CargoTier {
+    common
+    | uncommon
+    | relic
+}
+
+enum FrontierBracket {
+    minnow
+    | standard
+    | shark
+    | exhibition
+}
+
+-- A bounded run of the extraction loop. Free seasons run always-on on every
+-- realm; staked seasons run on dedicated shards with deposit entry and $WOC
+-- settlement at close. Both modes reuse the SAME extraction core.
+entity FrontierSeason {
+    id: Integer
+    mode: FrontierSeasonMode
+    phase: FrontierSeasonPhase
+    opens_at: Timestamp
+    closes_at: Timestamp
+    bracket_set: Set<FrontierBracket>
+    rake_config: RakeConfig
+
+    is_staked: mode = FrontierSeasonMode.staked
+    is_currently_open: phase = FrontierSeasonPhase.open
+
+    transitions phase {
+        scheduled -> open
+        open -> settling
+        settling -> closed
+        terminal: closed
+    }
+}
+
+entity RakeConfig {
+    season: FrontierSeason
+    turn_in_tax: Decimal
+    death_durability_loss: Decimal
+    consumable_cost: Integer
+    entry_fee: Integer
+}
+
+-- A real-money deposit that converts a wallet stake into a staked-season entry.
+-- Lives at the server boundary; the sim only sees the resulting FrontierMembership
+-- and cargo. This entity models the bridge, not anything inside src/sim/.
+entity StakedDeposit {
+    season: FrontierSeason
+    member: FrontierMembership
+    bracket: FrontierBracket
+    amount_token: Integer
+    deposited_at: Timestamp
+    settled: Boolean
+}
+
+------------------------------------------------------------
+-- External trigger surfaces
+------------------------------------------------------------
+
+-- Player commands. These arrive from outside the spec; no local rule emits
+-- them. `unreachableTrigger` notices for these are expected and acceptable.
+surface ArenaQueueCommand {
+    character: Character,
+    format: ArenaFormat
+}
+
+surface ArenaLeaveCommand {
+    character: Character
+}
+
+surface ArenaAugmentPickCommand {
+    character: Character,
+    augment_id: String
+}
+
+surface EnterFrontierCommand {
+    character: Character
+}
+
+surface LeaveFrontierCommand {
+    character: Character
+}
+
+surface GatherNodeCommand {
+    character: Character,
+    node: CargoNode
+}
+
+surface TurnInCargoCommand {
+    character: Character
+}
+
+surface OpenSeasonCommand {
+    season: FrontierSeason
+}
+
+surface CloseSeasonCommand {
+    season: FrontierSeason
+}
+
+-- The server-boundary token bridge. The sim never sees these directly: they
+-- are the surface the firewall exposes to the staked-layer code that lives
+-- OUTSIDE the sim purity boundary. Modeled here only so the firewall invariant
+-- can name the boundary.
+surface TokenDeposit {
+    season: FrontierSeason,
+    wallet: String,
+    amount_token: Integer
+}
+
+surface TokenSettlement {
+    season: FrontierSeason,
+    member: FrontierMembership,
+    amount_token: Integer
+}
+
+surface CargoNode {
+    tier: CargoTier
+}
+
+-- The deterministic tick. Temporal triggers hang off this clock.
+surface Tick {
+    t: Timestamp
+}
+
+------------------------------------------------------------
+-- PvP flagging (the isHostileTo gate, distilled)
+------------------------------------------------------------
+
+-- Duel start raises a duel flag on both combatants for the life of the duel.
+rule DuelStartFlagsBothCombatants {
+    when: DuelStart(a, b),
+    requires: a.flags.where(source = PvPSource.duel).count = 0,
+    requires: b.flags.where(source = PvPSource.duel).count = 0,
+    ensures: PvPFlag.created(bearer: a, source: PvPSource.duel)
+    ensures: PvPFlag.created(bearer: b, source: PvPSource.duel)
+}
+
+-- Arena match start flags every fighter on both teams for the life of the
+-- match. The flag carries the team the bearer is on so cross-team hostility
+-- resolves by comparing teams inside the same match.
+rule ArenaStartFlagsFighters {
+    when: e: ArenaMatch.created,
+    for c in e.team_a.members:
+        ensures: PvPFlag.created(bearer: c, source: PvPSource.arena_match, match: e, team: FrontierTeam.azure)
+    for c in e.team_b.members:
+        ensures: PvPFlag.created(bearer: c, source: PvPSource.arena_match, match: e, team: FrontierTeam.crimson)
+}
+
+-- Entering the Frontier band raises a frontier flag whose team is the
+-- character's permanent Frontier team. The flag is the ONLY source of overworld
+-- PvP hostility; it collapses the moment the bearer leaves the band.
+rule EnterFrontierRaisesZoneFlag {
+    when: EnterFrontierCommand(character),
+    requires: character.level >= config.frontier_min_level,
+    requires: not character.is_in_frontier_band,
+    requires: not character.is_queued_arena,
+    requires: character.flags.where(source = PvPSource.arena_match).count = 0,
+    requires: character.frontier_team != null,
+    ensures: character.is_in_frontier_band = true
+    ensures: PvPFlag.created(bearer: character, source: PvPSource.frontier_zone, team: character.frontier_team)
+}
+
+-- A jailed character is hostile to every other jailed character (the jail brawl)
+-- for the duration of both sentences. A visiting moderator (gm flag) is
+-- one-way hostile to jailed characters; the reverse is deliberately not true.
+rule JailSentenceRaisesBrawlFlag {
+    when: JailSentence(character),
+    requires: character.jailed = true,
+    ensures: PvPFlag.created(bearer: character, source: PvPSource.jail_brawl)
+}
+
+-- A live seasonal event flags its participants on opposing teams. The flag is
+-- bound to the event instance so hostility collapses when the event ends.
+rule SeasonalEventFlagsParticipants {
+    when: e: SeasonalEvent.created,
+    for c in e.team_a.members:
+        ensures: PvPFlag.created(bearer: c, source: PvPSource.seasonal_event, event: e, team: FrontierTeam.azure)
+    for c in e.team_b.members:
+        ensures: PvPFlag.created(bearer: c, source: PvPSource.seasonal_event, event: e, team: FrontierTeam.crimson)
+}
+
+-- Hostility resolution: two characters are hostile iff they carry live flags
+-- from the SAME source that pairwise mark them cross-team or both-jailed. This
+-- is the entire gate; no overworld PvP exists outside a live flag.
+rule HostilityRequiresPairedLiveFlags {
+    when: DamageAttempt(attacker, target),
+    requires: IsHostileUnderFlags(attacker, target),
+    ensures: DamageAllowed(attacker, target)
+}
+
+------------------------------------------------------------
+-- Honor: honorable kills with anti-farm diminishing returns
+------------------------------------------------------------
+
+-- Each honorable kill: compute the level factor, advance the (killer, victim)
+-- pair DR stage, then grant honor scaled by the pair multiplier. A repeat kill
+-- past the zero-DR stage still advances the pair but pays nothing.
+rule HonorableKillGrantsScaledHonor {
+    when: HonorKillEvent(killer, victim, at),
+    requires: IsHostileUnderFlags(killer, victim),
+    requires: killer.frontier_team != victim.frontier_team,
+    requires: not SharesParty(killer, victim),
+    let stage_before = StageFor(killer, victim),
+    let level_factor = LevelFactorFor(killer.level, victim.level),
+    let multiplier = HonorMultiplier(stage_before),
+    let base = config.honor_kill_base,
+    let granted = floor(base * level_factor * multiplier),
+    ensures: HonorKill.created(killer: killer, victim: victim, at: at, reason: HonorReason.honorable_kill, base_honor: base, level_factor: level_factor, pair_stage_before: stage_before, pair_stage_after: stage_before + 1, multiplier_applied: multiplier, honor_granted: granted)
+    ensures: AdvancePairStage(killer, victim)
+    ensures: killer.honor = killer.honor + granted
+    ensures: killer.lifetime_honor = killer.lifetime_honor + granted
+}
+
+-- The level-difference gate: full honor at equal level, decaying linearly to
+-- zero when the victim is five or more levels below the killer. No honor for
+-- trivial kills (PRD 7.1).
+rule LevelDifferenceGatesHonorToZero {
+    when: e: HonorKill.created,
+    let gap = max(0, e.killer.level - e.victim.level),
+    ensures: e.level_factor = if gap >= 5: 0 else: max(0, 1 - gap / 5)
+}
+
+-- A pair's DR stage resets to zero once the rolling window has elapsed since
+-- the last kill in that pair (PRD 7.1: hourly reset).
+rule PairDiminishingReturnResetsAfterWindow {
+    when: e: Tick.t <= now,
+    for dr in HonorDiminishingReturn where dr.is_reset:
+        ensures: dr.stage = 0
+}
+
+------------------------------------------------------------
+-- Honor: arena wins (ranked), daily taper and per-opponent DR
+------------------------------------------------------------
+
+-- A ranked arena win pays the format base, scaled by the per-opponent DR ladder
+-- (first win against the same opponent team that UTC day pays; repeats pay zero)
+-- and the total-wins daily taper. Unranked bouts never enter this rule.
+rule RankedArenaWinGrantsHonor {
+    when: ArenaWin(match, winner_team),
+    requires: not match.is_unranked,
+    requires: not match.is_practice_bot_match,
+    for c in winner_team.members:
+        ensures: RecordArenaWin(c, match.format, OpponentKeyOf(match, winner_team)) and c.arena_daily.total_wins = c.arena_daily.total_wins + 1 and c.honor = c.honor + RankedWinHonorFor(c, match, winner_team) and c.lifetime_honor = c.lifetime_honor + RankedWinHonorFor(c, match, winner_team)
+}
+
+-- The per-opponent DR ladder for arena wins: the first win against a given
+-- opponent team that day pays in full; every subsequent win against the same
+-- opponent team pays zero. One-opponent-coordination guard (honor.ts ARENA_REPEAT_DR).
+rule ArenaOpponentRepeatPaysZero {
+    when: ArenaWin(match, winner_team),
+    requires: not match.is_unranked,
+    for c in winner_team.members:
+        ensures: ArenaOpponentMultiplier(WinsVs(c, match.format, OpponentKeyOf(match, winner_team))) = ArenaOpponentMultiplierFor(WinsVs(c, match.format, OpponentKeyOf(match, winner_team)))
+}
+
+-- The daily taper by total ranked wins: full for the first ten wins of the UTC
+-- day, half from ten to fifteen, floor from fifteen on. Caps coordinated win
+-- trading past the first ten (honor.ts arenaDailyMultiplier).
+rule ArenaDailyTaperApplies {
+    when: ArenaWin(match, winner_team),
+    requires: not match.is_unranked,
+    for c in winner_team.members:
+        ensures: ArenaDailyTaper(c.arena_daily.total_wins) = ArenaDailyTaperFor(c.arena_daily.total_wins)
+}
+
+-- The UTC day boundary rolls each character's arena window back to empty: the
+-- per-opponent win counts and the total-wins taper reset so a new day's
+-- coordinated-win cap starts fresh (honor.ts dailyWindow rollover).
+rule ArenaDailyWindowRollsOverOnUtcDay {
+    when: e: Tick.t <= now,
+    for c in Character where c.arena_daily.utc_day != TodayUtc():
+        ensures: c.arena_daily.utc_day = TodayUtc()
+        ensures: c.arena_daily.total_wins = 0
+        ensures: ClearOpponentCounts(c.arena_daily)
+}
+
+------------------------------------------------------------
+-- Honor: Fiesta (unranked) takedowns and completion
+------------------------------------------------------------
+
+-- A Fiesta takedown pays the flat kill honor scaled by the per-(killer, victim)
+-- pair DR ladder, tracked inside the single match. Practice (bot) matches pay
+-- nothing (honor.ts awardFiestaKillHonor).
+rule FiestaTakedownGrantsHonor {
+    when: FiestaTakedown(match, killer, victim),
+    requires: match.format = ArenaFormat.fiesta_2v2,
+    requires: not match.is_practice_bot_match,
+    requires: IsArenaCrossTeam(match, killer, victim),
+    let prev = FiestaKillsByPair(match, killer, victim),
+    let mult = HonorMultiplier(prev),
+    let granted = floor(config.honor_fiesta_kill * mult),
+    ensures: RecordFiestaKillPair(match, killer, victim)
+    ensures: if granted > 0:
+        killer.honor = killer.honor + granted
+        killer.lifetime_honor = killer.lifetime_honor + granted
+}
+
+-- Completing a Fiesta bout pays the completion honor plus a win bonus, each
+-- scaled by the per-opponent completion DR. Forfeits do not count as completion
+-- (honor.ts awardFiestaCompletionHonor).
+rule FiestaCompletionGrantsHonorTeamA {
+    when: ArenaWin(match, winner_team),
+    requires: match.format = ArenaFormat.fiesta_2v2,
+    requires: not match.is_practice_bot_match,
+    requires: match.resolution != ArenaResolution.forfeit,
+    for c in match.team_a.members:
+        ensures: RecordFiestaCompletion(c, OpponentKeyOf(match, winner_team)) and c.honor = c.honor + FiestaCompletionHonorFor(c, match, winner_team) and c.lifetime_honor = c.lifetime_honor + FiestaCompletionHonorFor(c, match, winner_team)
+}
+
+rule FiestaCompletionGrantsHonorTeamB {
+    when: ArenaWin(match, winner_team),
+    requires: match.format = ArenaFormat.fiesta_2v2,
+    requires: not match.is_practice_bot_match,
+    requires: match.resolution != ArenaResolution.forfeit,
+    for c in match.team_b.members:
+        ensures: RecordFiestaCompletion(c, OpponentKeyOf(match, winner_team)) and c.honor = c.honor + FiestaCompletionHonorFor(c, match, winner_team) and c.lifetime_honor = c.lifetime_honor + FiestaCompletionHonorFor(c, match, winner_team)
+}
+
+------------------------------------------------------------
+-- Arena: queue, matchmake, start
+------------------------------------------------------------
+
+-- Joining an arena queue: guard stack then enqueue as a solo or premade unit.
+-- Guards mirror arenaQueueJoin: already queued, already in a match, dead, in a
+-- duel, in a trade, inside an instance, wrong party size for the format.
+rule ArenaQueueJoin {
+    when: ArenaQueueCommand(character, format),
+    requires: not character.is_queued_arena,
+    requires: character.flags.where(source = PvPSource.arena_match).count = 0,
+    requires: character.jailed = false,
+    requires: PartySizeOk(character, format),
+    ensures: ArenaTeam.created(format: format, members: PartyOf(character, format), rating_snapshot: TeamRating(character, format), queue_joined_at: now)
+    ensures: character.is_queued_arena = true
+}
+
+-- Matchmaking pairs the two closest-rated eligible units in a queue once a free
+-- arena slot exists. Premades pair off first; a lone premade fills from solos;
+-- four solos pair into two teams. Closest-rating-wins for every pairing arm.
+rule ArenaMatchmakePairsClosestRatedUnits {
+    when: e: Tick.t <= now,
+    requires: FreeArenaSlotExists(),
+    let pool = EligibleRankedUnits(),
+    requires: pool.count >= 2,
+    let anchor = First(pool),
+    let partner = ClosestRated(pool, anchor),
+    ensures: ArenaMatch.created(format: anchor.format, team_a: anchor, team_b: partner, rating_a_before: anchor.rating_snapshot, rating_b_before: partner.rating_snapshot, honor_team_a_key: TeamIdentity(anchor), honor_team_b_key: TeamIdentity(partner), phase: ArenaPhase.countdown, countdown_started_at: now, result_recorded: false)
+}
+
+-- The countdown elapses and the bout goes active. Pre-fight healing and prep
+-- end here; damage can now land (arena.ts updateArena countdown arm).
+rule ArenaCountdownEndsActivates {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where m.phase = ArenaPhase.countdown and now >= m.countdown_started_at + config.arena_countdown:
+        ensures: m.phase = ArenaPhase.active and m.active_started_at = now
+}
+
+------------------------------------------------------------
+-- Arena: resolution (Elo + honor), ranked vs unranked
+------------------------------------------------------------
+
+-- A ranked bout ending records Elo for both teams and triggers ranked-win
+-- honor for the winners. Unranked bouts record a zero delta and route to the
+-- Fiesta completion arm instead (arena.ts endArenaMatch).
+rule ArenaBoutEndsRecordsResult {
+    when: ArenaEnd(match, winner_team, reason),
+    requires: not match.result_recorded,
+    ensures: match.result_recorded = true
+    ensures: match.resolution = reason
+    ensures: match.winner = winner_team
+    ensures: match.ended_at = now
+    ensures: ArenaWin(match, winner_team)
+}
+
+-- Ranked bouts move both teams' ratings by the standard Elo delta, floored at
+-- the minimum rating. Win/loss counters tick on the matching format ladder
+-- (arena.ts addArenaResult + eloDelta).
+rule RankedBoutAppliesElo {
+    when: ArenaWin(match, winner_team),
+    requires: not match.is_unranked,
+    let winner_before = WinnerRatingBefore(match, winner_team),
+    let loser_before = LoserRatingBefore(match, winner_team),
+    let delta = EloDelta(winner_before, loser_before),
+    ensures: ArenaRatingChange.created(match: match, team: winner_team, delta: delta, rating_before: winner_before, rating_after: max(config.arena_min_rating, winner_before + delta), result: BoutResult.win)
+    ensures: ArenaRatingChange.created(match: match, team: LoserOf(match, winner_team), delta: -delta, rating_before: loser_before, rating_after: max(config.arena_min_rating, loser_before - delta), result: BoutResult.loss)
+}
+
+-- A draw (winner_team null on timeout-by-stall or on a tied score) moves each
+-- team toward its expected score by half, not a full win or loss (arena.ts).
+rule RankedDrawSplitsElo {
+    when: ArenaEnd(match, null, ArenaResolution.timeout),
+    requires: not match.is_unranked,
+    requires: not match.result_recorded,
+    let delta_a = EloDeltaHalf(match.rating_a_before, match.rating_b_before),
+    ensures: ArenaRatingChange.created(match: match, team: match.team_a, delta: delta_a, rating_before: match.rating_a_before, rating_after: max(config.arena_min_rating, match.rating_a_before + delta_a), result: BoutResult.draw)
+    ensures: ArenaRatingChange.created(match: match, team: match.team_b, delta: -delta_a, rating_before: match.rating_b_before, rating_after: max(config.arena_min_rating, match.rating_b_before - delta_a), result: BoutResult.draw)
+}
+
+-- A ranked bout that hits the duration cap without a decisive result is scored
+-- by team HP fraction: the higher fraction wins, and a near-deadlock (within
+-- the stall threshold) is a draw (arena.ts updateArena timeout arm).
+rule ArenaStallTimeoutScoresByHpFraction {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where m.phase = ArenaPhase.active and now >= m.active_started_at + config.arena_max_duration:
+        ensures: ArenaEnd(m, StallWinner(m), ArenaResolution.timeout)
+}
+
+-- A disconnect during a live ranked bout forfeits it to the team whose members
+-- are all still present. Yumi is lenient (whole-team missing); ranked and Fiesta
+-- forfeit on any single missing member (arena.ts updateArena missing-member arm).
+rule ArenaForfeitOnMissingMemberTeamA {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where (m.phase = ArenaPhase.countdown or m.phase = ArenaPhase.active) and AnyMissing(m.team_a) and not AnyMissing(m.team_b):
+        ensures: ArenaEnd(m, m.team_b, ArenaResolution.forfeit)
+}
+
+rule ArenaForfeitOnMissingMemberTeamB {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where (m.phase = ArenaPhase.countdown or m.phase = ArenaPhase.active) and AnyMissing(m.team_b) and not AnyMissing(m.team_a):
+        ensures: ArenaEnd(m, m.team_a, ArenaResolution.forfeit)
+}
+
+-- After the aftermath delay, the bout is destroyed: every fighter is returned
+-- to their queue position, the arena slot is freed, and the flags fall (arena.ts
+-- returnFromArena). An arena match is never a free heal: the HP, resource,
+-- cooldowns, and CC-DR carried in are restored.
+rule ArenaAftermathRemovesFlagsTeamA {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where m.phase = ArenaPhase.over and now >= m.ended_at + config.arena_return_delay:
+        for c in m.team_a.members:
+            ensures: RemoveFlag(c, PvPSource.arena_match)
+}
+
+rule ArenaAftermathRemovesFlagsTeamB {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where m.phase = ArenaPhase.over and now >= m.ended_at + config.arena_return_delay:
+        for c in m.team_b.members:
+            ensures: RemoveFlag(c, PvPSource.arena_match)
+}
+
+rule ArenaAftermathDestroysInstance {
+    when: e: Tick.t <= now,
+    for m in ArenaMatch where m.phase = ArenaPhase.over and now >= m.ended_at + config.arena_return_delay:
+        ensures: ArenaDestroyed(m)
+}
+
+------------------------------------------------------------
+-- PvP damage scaling (power.ts): rating converts to a capped offense/defense multiplier
+------------------------------------------------------------
+
+-- PvP combat damage is scaled by the attacker's WARFARE offense rating and the
+-- target's WARFARE defense rating, each capped. The multiplier is the product
+-- of (1 + offense) and (1 - defense): the only place PvP rating affects outcome.
+rule PvPCombatDamageScaledByRatings {
+    when: DamageAttempt(attacker, target),
+    requires: attacker.kind = player,
+    requires: target.kind = player,
+    requires: IsHostileUnderFlags(attacker, target),
+    let offense = min(config.pvp_offense_cap, RatingFraction(attacker.pvp_offense_rating)),
+    let defense = min(config.pvp_defense_cap, RatingFraction(target.pvp_defense_rating)),
+    let mult = (1 + offense) * (1 - defense),
+    ensures: DamageMultiplier(attacker, target, mult)
+}
+
+------------------------------------------------------------
+-- Frostreach Frontier: the free extraction loop (PRD sections 5 to 9)
+------------------------------------------------------------
+
+-- First entry per character assigns a permanent Frontier team: the currently
+-- smaller team among players in the zone, ties broken by the zone Rng. Party
+-- members entering together land on the same team when balance allows (PRD 5.1).
+rule FrontierFirstEntryAssignsPermanentTeam {
+    when: EnterFrontierCommand(character),
+    requires: character.frontier_team = null,
+    requires: character.level >= config.frontier_min_level,
+    let azure_count = InZoneCount(FrontierTeam.azure),
+    let crimson_count = InZoneCount(FrontierTeam.crimson),
+    let assigned = if azure_count < crimson_count: FrontierTeam.azure else if crimson_count < azure_count: FrontierTeam.crimson else: RngTeamPick(),
+    ensures: character.frontier_team = assigned
+    ensures: character.frontier_membership.team = assigned
+}
+
+-- Harvesting a Frontier node channels for the tier's duration, then moves one
+-- cargo unit of the node's tier into the harvester's cargo hold (up to the cap).
+-- The harvester is stationary and visible for the whole channel: contested by
+-- design (PRD 6.1/6.2).
+rule GatherNodeAddsCargo {
+    when: GatherNodeCommand(character, node),
+    requires: character.is_in_frontier_band,
+    requires: ChannelCompletes(character, node),
+    requires: character.frontier_membership.cargo.count < config.frontier_cargo_capacity,
+    ensures: CargoUnit.created(tier: node.tier, holder: character.frontier_membership)
+}
+
+-- Leaving the band (the Leave button, or teleport-out, or death-release) drops
+-- the frontier flag immediately. Carried cargo is forfeit on teleport-out: the
+-- only way to realize value is the turn-in officer at base (PRD 5.2/6.2).
+rule LeaveFrontierDropsFlagAndForfeitsCargo {
+    when: LeaveFrontierCommand(character),
+    requires: character.is_in_frontier_band,
+    requires: ChannelCompletes(character, leave),
+    ensures: RemoveFlag(character, PvPSource.frontier_zone)
+    ensures: character.is_in_frontier_band = false
+    ensures: ForfeitCargo(character.frontier_membership)
+}
+
+-- Dying in the Frontier drops the victim's entire cargo as a lootable satchel
+-- lootable by the OPPOSING team only. Equipped gear never drops. Same-team
+-- kills cannot launder cargo this way (PRD 6.3).
+rule FrontierDeathDropsCargoForOpposingTeam {
+    when: FrontierDeath(victim, killer),
+    requires: victim.is_in_frontier_band,
+    let satchel_team = OpposingTeam(victim.frontier_team),
+    ensures: CargoSatchel.created(at: now, ttl: config.frontier_cargo_satchel_ttl, lootable_by: satchel_team, contents: victim.frontier_membership.cargo)
+    ensures: ForfeitCargo(victim.frontier_membership)
+}
+
+-- Turn-in at base converts cargo to honor (and a copper stipend) at the tier
+-- rates; turn-ins also feed the hourly team score (PRD 6.4/8.4).
+rule TurnInCargoGrantsHonor {
+    when: TurnInCargoCommand(character),
+    requires: character.is_in_frontier_band,
+    requires: AtBaseOfficer(character),
+    let common = CargoCount(character, CargoTier.common),
+    let uncommon = CargoCount(character, CargoTier.uncommon),
+    let relic = CargoCount(character, CargoTier.relic),
+    let honor = common * config.honor_turnin_common + uncommon * config.honor_turnin_uncommon + relic * config.honor_turnin_relic,
+    ensures: character.honor = character.honor + honor
+    ensures: character.lifetime_honor = character.lifetime_honor + honor
+    ensures: ClearCargo(character.frontier_membership)
+    ensures: AddTeamScore(character.frontier_team, common + uncommon + relic)
+}
+
+------------------------------------------------------------
+-- Frostreach Frontier: the staked-seasons layer (PRD section 12)
+------------------------------------------------------------
+
+-- Opening a season transitions it from scheduled to open. Free seasons are
+-- always-on on every realm; staked seasons run on dedicated shards only and
+-- require level 20 for entry (PRD 12.1/12.5).
+rule OpenSeason {
+    when: OpenSeasonCommand(season),
+    requires: season.phase = FrontierSeasonPhase.scheduled,
+    requires: now >= season.opens_at,
+    ensures: season.phase = FrontierSeasonPhase.open
+}
+
+-- Closing a season transitions open to settling, then to closed. Settlement
+-- converts each member's extracted cargo value back to $WOC at the boundary.
+-- The sim itself only sees cargo/honor/copper: the $WOC mapping lives outside.
+rule CloseSeasonSettlesAndCloses {
+    when: CloseSeasonCommand(season),
+    requires: season.phase = FrontierSeasonPhase.open,
+    requires: now >= season.closes_at,
+    for m in FrontierMembership where m.is_in_zone:
+        ensures: TokenSettlement(season: season, member: m, amount_token: CargoValueInToken(m))
+    ensures: season.phase = FrontierSeasonPhase.settling
+    ensures: season.phase = FrontierSeasonPhase.closed
+}
+
+-- A staked season entry: a wallet deposit at the server boundary places the
+-- character in a deposit-size bracket and creates their FrontierMembership.
+-- This is the ONLY place the $WOC token crosses the firewall; the sim then
+-- treats the member like any free-loop player (PRD 12.2/12.5).
+rule StakedDepositCreatesBracketedMember {
+    when: TokenDeposit(season, wallet, amount_token),
+    requires: season.is_staked,
+    requires: season.is_currently_open,
+    requires: WalletVerified(wallet),
+    requires: WalletOwnerLevel(wallet) >= config.frontier_staked_min_level,
+    let bracket = BracketForDeposit(amount_token, season.bracket_set),
+    ensures: StakedDeposit.created(season: season, bracket: bracket, amount_token: amount_token, settled: false)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Honor is soulbound: it never trades, never mails, and never bridges to $WOC
+-- in any mode. This is what keeps kill DR a balance knob instead of wash-trading
+-- security, and what keeps the identity moat from being for sale (PRD 12.3).
+invariant HonorIsSoulbound {
+    for c in Character:
+        c.honor >= 0 and c.lifetime_honor >= c.honor
+}
+
+-- Every honor grant updates the spendable counter and the lifetime counter in
+-- lockstep. Lifetime never trails spendable; the two rise together (honor.ts grantHonor).
+invariant HonorAndLifetimeMoveTogether {
+    for c in Character:
+        c.lifetime_honor >= c.honor
+}
+
+-- The diminishing-returns ladder is monotonic and bounded: the multiplier is
+-- one of the four ladder values (full, half, quarter, zero) and never negative.
+-- Past stage 3 the multiplier is pinned to zero (honor.ts repeatHonorMultiplier).
+invariant HonorDRLadderIsBounded {
+    for k in HonorKill:
+        k.multiplier_applied = config.honor_dr_full or k.multiplier_applied = config.honor_dr_half or k.multiplier_applied = config.honor_dr_quarter or k.multiplier_applied = config.honor_dr_zero
+}
+
+-- Arena rating never falls below the floor. A losing streak cannot collapse a
+-- rating to absurdity (arena.ts ARENA_MIN_RATING).
+invariant ArenaRatingFloored {
+    for c in Character:
+        c.arena_rating_1v1 >= config.arena_min_rating and c.arena_rating_2v2 >= config.arena_min_rating
+}
+
+-- A ranked bout is scored exactly once. A disconnect during the aftermath must
+-- clean up the instance but can never move Elo or honor a second time (arena.ts
+-- resultRecorded gate).
+invariant ArenaBoutScoredOnce {
+    for m in ArenaMatch where m.result_recorded = true:
+        ArenaRatingChange.where(match = m).count <= 2
+}
+
+-- Hostility is flag-paired: no two characters are ever hostile without both
+-- carrying live flags from the same source that mark them cross-team or both
+-- jailed. There is no overworld PvP outside a live flag (PRD 5.2; isHostileTo).
+invariant HostilityRequiresLiveFlag {
+    for attacker in Character:
+        for target in Character:
+            IsHostileUnderFlags(attacker, target) implies
+                (attacker.flags.any(f: PairedWith(f, target)) or attacker.jailed and target.jailed)
+}
+
+-- A character is in at most one arena queue, at most one live arena match, and
+-- never in both a queue and a match (arena.ts queue/match guards).
+invariant AtMostOneArenaPresence {
+    for c in Character:
+        c.flags.where(source = PvPSource.arena_match).count <= 1
+}
+
+-- The team assignment is permanent per character: once a Frontier team is set
+-- it never changes. Swapping teams would enable spying, kill-trading, and
+-- vendor double-dipping (PRD 5.1).
+invariant FrontierTeamIsPermanent {
+    for c in Character where c.frontier_team != null:
+        StableTeam(c)
+}
+
+-- The hourly event scheduler draws only from the zone Rng and fires on sim-time
+-- hours, never wall-clock: keeps offline and headless determinism (PRD 8.1).
+invariant FrontierEventsUseSimTimeAndZoneRng {
+    for s in FrontierSeason:
+        EventsDrawnFromZoneRng(s)
+}
+
+-- THE TOKEN FIREWALL (PRD 12.2): $WOC and wallets never enter src/sim/. The
+-- sim's vocabulary ends at cargo, honor, and copper. The only crossing point is
+-- the server boundary (TokenDeposit, TokenSettlement surfaces), which the sim
+-- consumes as plain FrontierMembership and cargo. The game is complete and
+-- playable with zero money attached; the stakes layer is a server-side mapping.
+invariant TokenFirewallSimVocabularyEndsAtCargoHonorCopper {
+    for s in FrontierSeason:
+        SimTouchesNoToken(s)
+    for d in StakedDeposit:
+        SettledThroughBoundaryOnly(d)
+}
+
+-- Two loops, one design (PRD 12.1): the free loop and the staked loop run the
+-- SAME extraction core. The staked layer never re-implements the loop; it
+-- reuses the free loop and adds a deposit/settlement mapping at the boundary.
+invariant StakedSeasonsReuseFreeLoop {
+    for s in FrontierSeason where s.is_staked:
+        UsesSameExtractionCoreAs(s, FrontierSeasonMode.free)
+}
+
+-- A staked season's brackets are deposit-sized, not skill-rated. Honor is a
+-- currency, not a rating; staked seasons bracket by deposit, the free zone is
+-- where players earn the level 20 required for staked entry (PRD 4 non-goal, 12.5).
+invariant StakedBracketsByDepositNotSkill {
+    for s in FrontierSeason where s.is_staked:
+        for b in s.bracket_set:
+            b = FrontierBracket.minnow or b = FrontierBracket.standard or b = FrontierBracket.shark or b = FrontierBracket.exhibition
+}

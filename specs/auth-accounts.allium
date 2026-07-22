@@ -1,0 +1,958 @@
+-- allium: 3
+-- auth-accounts.allium
+-- Scope: the account identity, the sessions that authenticate a request, the provider links that establish that identity, and the character selection that ends at entering the world.
+-- Includes: Account, LinkedProvider, Session, CharacterLease, PendingProviderLogin, DesktopLoginCode, PasswordResetRequest, EmailChangeRequest, TotpState, Character (selection facet), Realm; the Register, LoginPassword, LoginTotpChallenge, LoginTotpVerify, VerifyProviderIdentity, ProviderLoginReturning, ProviderLoginProvision, ProviderLoginLinkExisting, LinkProvider, UnlinkProvider, LinkSteamMirror, AuthenticateRequest, RevokeSession, RevokeOtherSessions, RevokeAllSessions, ExpireSession, ListCharacters, CreateCharacter, SelectCharacterEnter, SelectCharacterTakeover, EnterWorldHandshake, ExpireCharacterLease, CreateDesktopLoginCode, ExchangeDesktopLoginCode, ChangePassword, RequestPasswordReset, ConsumePasswordReset, DeactivateAccount, SetupTotp, EnableTotp, DisableTotp, SetInitialEmail, RequestEmailChange, VerifyEmailChange rules; the session currency, provider authority, Steam is a mirror not an authority, provider subject uniqueness, character scope, character cap, force-rename blocks entry, lease exclusivity, realm admission cap, two-factor replay guard, single-use link token, anti-enumeration, deactivation revokes all, and read scope cannot mutate invariants.
+-- Excludes: the REST request pipeline, middleware onion, route tables, and HTTP status codes (rest-pipeline spec); admin and moderator authz, how a moderation lock is set or lifted, the ban and suspension reason vocabulary (moderation spec); the in-game session loop, sim tick, snapshot streaming, command dispatch, linkdead grace timing, and the world authority contract (server-authority spec); TOTP RFC 6238 internals, scrypt parameters, token byte format, signature algorithm specifics, PKCE S256 math, cookie and header mechanics; the in-world character state blob, gear, bags, bank, quests, talents, and save cadence (the character is modelled only as the selection facet up to world entry); economy and wallet linking, the $WOC firewall, Claudium, and bank bonus sources (economy-bank spec); i18n of error literals and the client prose matcher; analytics, Meta CAPI conversion events, and email delivery.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Timestamp {}
+
+value Duration {}
+
+-- A realm world shard. One process hosts one realm; every character, lease,
+-- and session is scoped to one.
+value RealmName {
+  name: String,
+  kind: String,
+  origin: String
+}
+
+-- A class a new character can pick. The authority is the content table; only
+-- the name rides this facet.
+value PlayerClass {
+  name: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+  SESSION_TTL_HOURS: Duration = 168.hours,
+  COMPANION_TOKEN_TTL_HOURS: Duration = 2160.hours,
+  USERNAME_MIN: Integer = 3,
+  USERNAME_MAX: Integer = 24,
+  PASSWORD_MIN: Integer = 6,
+  PASSWORD_MAX: Integer = 128,
+  EMAIL_MAX: Integer = 254,
+  CHARACTER_LIMIT: Integer = 10,
+  CHARACTER_NAME_MIN: Integer = 2,
+  CHARACTER_NAME_MAX: Integer = 16,
+  VALID_CLASSES: Integer = 9,
+  MAX_SKIN: Integer = 7,
+  AUTH_TIMEOUT: Duration = 10.seconds,
+  LINKDEAD_GRACE: Duration = 300.seconds,
+  CHARACTER_LEASE_TTL: Duration = 90.seconds,
+  DESKTOP_LOGIN_TTL: Duration = 300.seconds,
+  PENDING_LOGIN_TTL: Duration = 900.seconds,
+  PASSWORD_RESET_TTL: Duration = 1.hours,
+  EMAIL_CHANGE_TTL: Duration = 24.hours,
+  TOTP_WINDOW: Duration = 30.seconds,
+  MAX_PLAYERS_PER_REALM: Integer = 5000,
+  MAX_WS_PER_IP_HARD: Integer = 0,
+  MAX_FRESH_ADMISSIONS_IN_FLIGHT: Integer = 0
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The providers a user can choose among. The variation is the feature: a user
+-- signs in with one and may link several. Only the password, apple, and discord
+-- kinds ever establish an identity; github and steam are link-only.
+enum ProviderKind {
+  password
+  | apple
+  | discord
+  | github
+  | steam
+}
+
+enum SessionScope {
+  read
+  | full
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The moderation service owns the lock decision (ban, suspension, self
+-- deactivation). This facet only READS the predicate at every auth gate; how
+-- the lock is set or lifted lives in the moderation spec.
+entity ModerationService {
+  reachable: Boolean
+}
+
+-- An external identity provider (Apple, Discord, GitHub) or the Steam publisher
+-- that verifies a credential and returns a verified subject id. The credential
+-- format and verification algorithm are out of scope: a verified identity is
+-- modelled as a returned subject id.
+entity IdentityProvider {
+  kind: ProviderKind,
+  configured: Boolean,
+  reachable: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- An account is the persistent identity. It owns characters across realms and
+-- the linked providers that can establish a session for it. Password may be
+-- unset (a provider-provisioned account); email is the recovery address and is
+-- only treated as verified when emailVerified holds. The two-factor fields ride
+-- on the account: totpEnabledAt arms the second factor, totpPendingSecret is
+-- the not-yet-confirmed secret from setup, totpLastWindow is the replay guard.
+entity Account {
+  id: Integer,
+  username: String,
+  passwordHash: String,
+  passwordSet: Boolean,
+  email: String,
+  emailVerified: Boolean,
+  totpEnabledAt: Timestamp,
+  totpPendingSecret: String,
+  totpLastWindow: Integer,
+  deactivated: Boolean
+}
+
+-- A provider identity attached to an account. The subject id is the provider's
+-- stable user id returned by a verified credential. Discord and apple links
+-- can establish a session; github and steam links never do.
+entity LinkedProvider {
+  account: Account,
+  kind: ProviderKind,
+  subjectId: String,
+  linkedAt: Timestamp
+}
+
+-- A session is the currency a request spends. The token is an opaque
+-- unguessable secret; scope gates mutation (only full can write); expiresAt is
+-- the wall-clock expiry; issuedBy is the provider that minted it. A read token
+-- (a companion or OAuth grant) is the same row with scope read.
+entity Session {
+  token: String,
+  account: Account,
+  scope: SessionScope,
+  issuedBy: ProviderKind,
+  issuedAt: Timestamp,
+  expiresAt: Timestamp,
+  revoked: Boolean
+}
+
+-- The per-character load lease acquired at the world-entry handshake. One
+-- character has at most one live lease; the nonce fences a stale release; the
+-- holder account arm lets an owner reclaim its own stranded lease before TTL.
+entity CharacterLease {
+  character: Character,
+  holder: Account,
+  nonce: String,
+  acquiredAt: Timestamp,
+  expiresAt: Timestamp,
+  released: Boolean
+}
+
+-- A verified provider identity parked under a one-time link token, awaiting the
+-- player's choice to provision a new account or link an existing one. Single
+-- use, TTL bounded. The first-time Apple and Discord login paths use it.
+entity PendingProviderLogin {
+  kind: ProviderKind,
+  subjectId: String,
+  email: String,
+  emailVerified: Boolean,
+  linkToken: String,
+  expiresAt: Timestamp,
+  consumed: Boolean
+}
+
+-- A short-lived, single-use, IP-bound handoff code minted by an authenticated
+-- browser session and traded by the desktop shell for a full session. The code
+-- is the credential on the exchange leg.
+entity DesktopLoginCode {
+  account: Account,
+  code: String,
+  ip: String,
+  issuedAt: Timestamp,
+  expiresAt: Timestamp,
+  consumed: Boolean
+}
+
+-- A one-time password reset request mailed to the recovery address. The token
+-- hash is the authorization; applying it rotates the password and revokes every
+-- session. Single use, TTL bounded.
+entity PasswordResetRequest {
+  account: Account,
+  tokenHash: String,
+  expiresAt: Timestamp,
+  consumed: Boolean
+}
+
+-- A one-time verified email change. Mailed to the new address; only on verify
+-- does the recovery address move. Single use, TTL bounded.
+entity EmailChangeRequest {
+  account: Account,
+  newEmail: String,
+  tokenHash: String,
+  expiresAt: Timestamp,
+  consumed: Boolean
+}
+
+-- The character as the selection facet: everything the auth surface needs to
+-- decide whether the player can enter or must take over. The in-world state
+-- blob, gear, level progression, and save cadence live in the server-authority
+-- spec; this facet ends at the world-entry transition.
+entity Character {
+  id: Integer,
+  account: Account,
+  realm: RealmName,
+  name: String,
+  class: PlayerClass,
+  level: Integer,
+  skin: Integer,
+  forceRename: Boolean,
+  online: Boolean,
+  enteringWorld: Boolean
+}
+
+------------------------------------------------------------
+-- Surface
+------------------------------------------------------------
+
+-- The boundary the host drives this facet through. The host owns the wire
+-- details, the rate limiter, the IP block, the anti-bot gate, and the cookie
+-- the browser session rides; this facet owns only the identity and selection
+-- decisions.
+surface AuthSurface {
+  facing host: Host
+
+  provides:
+    SubmitRegister(host, username, password, email)
+    SubmitLogin(host, username, password, code, recoveryCode)
+    SubmitProviderIdentity(host, provider, credential, displayName)
+    ChooseProvisionAccount(host, linkToken)
+    ChooseLinkExisting(host, linkToken, username, password, code)
+    SubmitLinkProvider(host, account, provider, credential)
+    SubmitUnlinkProvider(host, account, provider)
+    SubmitChangePassword(host, account, current, next, callerToken)
+    SubmitPasswordReset(host, username)
+    SubmitPasswordResetConfirm(host, token, next)
+    SubmitDeactivate(host, account, username, password)
+    SubmitTotpSetup(host, account, password)
+    SubmitTotpEnable(host, account, code)
+    SubmitTotpDisable(host, account, password)
+    SubmitSetInitialEmail(host, account, email)
+    SubmitEmailChange(host, account, password, newEmail)
+    SubmitEmailVerify(host, token)
+    SubmitListCharacters(host, account, realm)
+    SubmitCreateCharacter(host, account, realm, name, cls, skin)
+    SubmitSelectCharacter(host, account, character)
+    SubmitEnterWorld(host, account, character, token, ip)
+    SubmitDesktopLoginCreate(host, account, ip)
+    SubmitDesktopLoginExchange(host, code, ip)
+    Authenticate(host, token)
+    Revoke(host, token)
+}
+
+------------------------------------------------------------
+-- Registration and password login rules
+------------------------------------------------------------
+
+-- Register a new account. Username, password, and a recovery email are all
+-- mandatory; the username must be a fresh, allowed shape; a concurrent
+-- registration that wins the unique race still surfaces as the same refusal.
+rule Register {
+  when: SubmitRegister(host, username, password, email)
+  let normEmail = NormalizeEmail(email)
+  requires: ValidUsernameShape(username)
+  requires: not OffensiveName(username)
+  requires: ValidPassword(password)
+  requires: normEmail != null
+  requires: not exists Account where Account.username = username
+  let hash = HashPassword(password)
+  ensures: Account.created(username = username, passwordHash = hash, passwordSet = true, email = normEmail, emailVerified = false, totpEnabledAt = null, deactivated = false)
+  ensures: IssueSession(host, account = Account.last, scope = full, issuedBy = password)
+}
+
+-- Password login. The per-account throttle and the invalid-credentials refusal
+-- never reveal whether the account exists; a moderation lock or an active IP
+-- block refuses after the password verifies. A 2FA account needs a code.
+rule LoginPassword {
+  when: SubmitLogin(host, username, password, code, recoveryCode)
+  requires: not AccountThrottled(username)
+  let account = Account where Account.username = username
+  if account = null or not VerifyPassword(account.passwordHash, password):
+    ensures: AuthFailed(host, "invalid username or password")
+  else:
+    requires: not ModerationLocked(account)
+    requires: not IpBlocked(host)
+    if account.totpEnabledAt != null and code = "" and recoveryCode = "":
+      ensures: TwoFactorChallenge(host)
+    else:
+      if account.totpEnabledAt != null:
+        requires: VerifySecondFactor(account, code, recoveryCode)
+      ensures: IssueSession(host, account = account, scope = full, issuedBy = password)
+}
+
+-- A 2FA account with no code returns a challenge, never a token.
+rule LoginTotpChallenge {
+  when: SubmitLogin(host, username, password, "", "")
+  let account = Account where Account.username = username
+  requires: account != null
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: account.totpEnabledAt != null
+  ensures: TwoFactorChallenge(host)
+}
+
+-- Verify the second factor. A live TOTP code is replay-guarded by its window;
+-- a recovery code is single-use. Either path fails closed on any unexpected
+-- state.
+rule LoginTotpVerify {
+  when: SubmitLogin(host, username, password, code, recoveryCode)
+  let account = Account where Account.username = username
+  requires: account != null
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: account.totpEnabledAt != null
+  requires: code != "" or recoveryCode != ""
+  let window = VerifyTotp(account, code)
+  if code != "":
+    requires: window != null
+    requires: account.totpLastWindow = null or window > account.totpLastWindow
+    ensures: account.totpLastWindow = window
+  else:
+    requires: ConsumeRecoveryCode(account, recoveryCode)
+}
+
+------------------------------------------------------------
+-- Provider login rules
+------------------------------------------------------------
+
+-- Verify a credential with an external provider and either log the owning
+-- account in (a returning user) or park the identity under a one-time link
+-- token for the player to choose (a first time user). The provider's verified
+-- subject id is the only identity proof accepted; the client never names its
+-- own.
+rule VerifyProviderIdentity {
+  when: SubmitProviderIdentity(host, provider, credential, displayName)
+  let idp = IdentityProvider where IdentityProvider.kind = provider
+  requires: idp.configured
+  requires: idp.reachable
+  let identity = VerifyCredential(idp, credential)
+  requires: identity != null
+  let link = LinkedProvider where LinkedProvider.kind = provider and LinkedProvider.subjectId = identity.subjectId
+  if link != null:
+    requires: not ModerationLocked(link.account)
+    ensures: IssueSession(host, account = link.account, scope = full, issuedBy = provider)
+    if identity.email != null and identity.emailVerified:
+      ensures: SeedRecoveryEmail(link.account, identity.email, identity.emailVerified)
+  else:
+    ensures: PendingProviderLogin.created(kind = provider, subjectId = identity.subjectId, email = identity.email, emailVerified = identity.emailVerified, linkToken = FreshToken(), expiresAt = now + PENDING_LOGIN_TTL, consumed = false)
+    ensures: ProviderChoosePrompted(host, displayName)
+}
+
+-- A returning provider login mints a session directly.
+rule ProviderLoginReturning {
+  when: SubmitProviderIdentity(host, provider, credential, displayName)
+  let link = LinkedProvider where LinkedProvider.kind = provider and LinkedProvider.subjectId = VerifiedSubject(provider, credential)
+  requires: link != null
+  requires: not ModerationLocked(link.account)
+  ensures: IssueSession(host, account = link.account, scope = full, issuedBy = provider)
+}
+
+-- First-time chooser: provision a fresh password-less account from the parked
+-- identity and link it. A race that links the subject first falls back to
+-- logging into the real owner.
+rule ProviderLoginProvision {
+  when: ChooseProvisionAccount(host, linkToken)
+  let pending = PendingProviderLogin where PendingProviderLogin.linkToken = linkToken
+  requires: pending != null
+  requires: pending.consumed = false
+  requires: pending.expiresAt > now
+  let existing = LinkedProvider where LinkedProvider.kind = pending.kind and LinkedProvider.subjectId = pending.subjectId
+  if existing != null:
+    requires: not ModerationLocked(existing.account)
+    ensures: pending.consumed = true
+    ensures: IssueSession(host, account = existing.account, scope = full, issuedBy = pending.kind)
+  else:
+    let username = ProviderUsername(pending)
+    ensures: Account.created(username = username, passwordHash = RandomHash(), passwordSet = false, email = pending.email, emailVerified = pending.emailVerified, totpEnabledAt = null, deactivated = false)
+    ensures: LinkedProvider.created(account = Account.last, kind = pending.kind, subjectId = pending.subjectId, linkedAt = now)
+    ensures: pending.consumed = true
+    ensures: IssueSession(host, account = Account.last, scope = full, issuedBy = pending.kind)
+}
+
+-- First-time chooser: link the parked identity to an existing account after
+-- re-verifying its password (and second factor). The pending token is consumed
+-- only on the final commit, so a wrong password or a 2FA challenge leaves it
+-- reusable.
+rule ProviderLoginLinkExisting {
+  when: ChooseLinkExisting(host, linkToken, username, password, code)
+  let pending = PendingProviderLogin where PendingProviderLogin.linkToken = linkToken
+  requires: pending != null
+  requires: pending.consumed = false
+  requires: pending.expiresAt > now
+  let account = Account where Account.username = username
+  requires: account != null
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: not ModerationLocked(account)
+  if account.totpEnabledAt != null:
+    requires: VerifySecondFactor(account, code, "")
+  requires: not exists LinkedProvider where LinkedProvider.kind = pending.kind and LinkedProvider.subjectId = pending.subjectId
+  ensures: pending.consumed = true
+  ensures: LinkedProvider.created(account = account, kind = pending.kind, subjectId = pending.subjectId, linkedAt = now)
+  if pending.email != null and pending.emailVerified:
+    ensures: SeedRecoveryEmail(account, pending.email, pending.emailVerified)
+  ensures: IssueSession(host, account = account, scope = full, issuedBy = pending.kind)
+}
+
+------------------------------------------------------------
+-- Provider linking rules
+------------------------------------------------------------
+
+-- Attach a provider identity to an already-authenticated account. The provider
+-- subject must not already be linked elsewhere; a verified credential is the
+-- only proof.
+rule LinkProvider {
+  when: SubmitLinkProvider(host, account, provider, credential)
+  let idp = IdentityProvider where IdentityProvider.kind = provider
+  requires: idp.configured
+  let identity = VerifyCredential(idp, credential)
+  requires: identity != null
+  requires: not exists LinkedProvider where LinkedProvider.account = account and LinkedProvider.kind = provider
+  requires: not exists LinkedProvider where LinkedProvider.kind = provider and LinkedProvider.subjectId = identity.subjectId
+  ensures: LinkedProvider.created(account = account, kind = provider, subjectId = identity.subjectId, linkedAt = now)
+}
+
+-- Steam linking is a special case: it is a MIRROR pointer for the deeds
+-- achievement mirror, never an identity or session source. The Steam id is
+-- taken from the publisher-verified ticket, never trusted from the client; a
+-- VAC or publisher ban refuses. A squatter is displaced by fresh proof.
+rule LinkSteamMirror {
+  when: SubmitLinkProvider(host, account, steam, credential)
+  let idp = IdentityProvider where IdentityProvider.kind = steam
+  requires: idp.configured
+  let ticket = VerifySteamTicket(idp, credential)
+  requires: ticket != null
+  requires: not ticket.banned
+  let squatter = LinkedProvider where LinkedProvider.kind = steam and LinkedProvider.subjectId = ticket.steamId
+  if squatter != null:
+    requires: squatter.account != account
+    ensures: not exists squatter
+    ensures: LinkedProvider.created(account = account, kind = steam, subjectId = ticket.steamId, linkedAt = now)
+  else:
+    requires: not exists LinkedProvider where LinkedProvider.account = account and LinkedProvider.kind = steam
+    ensures: LinkedProvider.created(account = account, kind = steam, subjectId = ticket.steamId, linkedAt = now)
+}
+
+rule UnlinkProvider {
+  when: SubmitUnlinkProvider(host, account, provider)
+  let link = LinkedProvider where LinkedProvider.account = account and LinkedProvider.kind = provider
+  requires: link != null
+  ensures: not exists link
+}
+
+------------------------------------------------------------
+-- Session rules
+------------------------------------------------------------
+
+-- Mint a session token. The token is an unguessable secret; the scope and the
+-- issuing provider are stamped at creation; expiry is the wall-clock TTL.
+rule IssueSession {
+  when: IssueSession(host, account, scope, issuedBy)
+  let token = FreshToken()
+  ensures: Session.created(token = token, account = account, scope = scope, issuedBy = issuedBy, issuedAt = now, expiresAt = now + SESSION_TTL_HOURS, revoked = false)
+  ensures: SessionIssued(host, account, token, scope)
+}
+
+-- A request is authenticated by resolving the bearer token to exactly one
+-- account, requiring a live, unexpired, scope-matching row. A missing, unknown,
+-- or revoked token refuses; nothing about whether the account exists leaks.
+rule AuthenticateRequest {
+  when: Authenticate(host, token)
+  let session = Session where Session.token = token
+  let moderation = ModerationService
+  requires: session != null
+  requires: session.revoked = false
+  requires: session.expiresAt > now
+  requires: moderation.reachable
+  requires: not ModerationLocked(moderation, session.account)
+  ensures: Authenticated(host, session.account, session.scope)
+}
+
+-- A mutation additionally requires full scope: a read token (companion or
+-- OAuth grant) can never write. This is the scope fence behind every mutating
+-- route.
+rule AuthenticateMutation {
+  when: Authenticate(host, token)
+  let session = Session where Session.token = token
+  requires: session != null
+  requires: session.revoked = false
+  requires: session.expiresAt > now
+  requires: session.scope = full
+  requires: not ModerationLocked(session.account)
+  ensures: MutationAllowed(host, session.account)
+}
+
+-- A read-scoped token mints no further token and writes no state: a companion
+-- or OAuth read grant cannot escalate to full.
+rule ReadScopeCannotMutate {
+  when: SubmitMutation(host, token)
+  let session = Session where Session.token = token
+  if session != null and session.scope = read:
+    ensures: Refused(host, "read only")
+}
+
+rule RevokeSession {
+  when: Revoke(host, token)
+  let session = Session where Session.token = token
+  requires: session != null
+  ensures: session.revoked = true
+}
+
+-- A password change keeps this device signed in and signs out every other.
+rule RevokeOtherSessions {
+  when: SubmitChangePassword(host, account, current, next, callerToken)
+  let session = Session where Session.token = callerToken
+  requires: session != null
+  for s in Session where Session.account = account and s.token != callerToken and s.revoked = false:
+    ensures: s.revoked = true
+}
+
+-- Deactivation locks the account and revokes every session.
+rule RevokeAllSessions {
+  when: SubmitDeactivate(host, account, username, password)
+  for s in Session where Session.account = account and s.revoked = false:
+    ensures: s.revoked = true
+}
+
+-- A session expires after its wall-clock TTL. An expired session authenticates
+-- nothing.
+rule ExpireSession {
+  when: s: Session.expiresAt <= now
+  requires: s.revoked = false
+  ensures: s.revoked = true
+}
+
+------------------------------------------------------------
+-- Character selection and world entry rules
+------------------------------------------------------------
+
+-- List the characters an account owns on a realm. A read or full session may
+-- read; the in-world online flag and the force-rename flag drive the entry
+-- decision.
+rule ListCharacters {
+  when: SubmitListCharacters(host, account, realm)
+  requires: not ModerationLocked(account)
+  ensures: CharactersListed(host, account, realm, CharactersIn(account, realm))
+}
+
+-- Create a character, capped at CHARACTER_LIMIT per account on the realm, with
+-- a server-canonicalized name and a valid class. A name held only by a
+-- deactivated account is reclaimed once; any other collision is a refusal.
+rule CreateCharacter {
+  when: SubmitCreateCharacter(host, account, realm, rawName, cls, skin)
+  let name = NormalizeCharName(rawName)
+  requires: name != null
+  requires: not OffensiveName(name)
+  requires: IsValidClass(cls)
+  requires: Count(Character where Character.account = account and Character.realm = realm) < CHARACTER_LIMIT
+  requires: not exists Character where Character.name = name and AccountOf(Character).deactivated = false
+  let clampedSkin = Clamp(skin, 0, MAX_SKIN)
+  ensures: Character.created(account = account, realm = realm, name = name, class = cls, level = 1, skin = clampedSkin, forceRename = false, online = false, enteringWorld = false)
+}
+
+-- Selecting a character resolves to exactly one primary action. No selection or
+-- a forced rename disables entry; an online character means taking its session
+-- over; otherwise the character enters the world.
+rule SelectCharacterEnter {
+  when: SubmitSelectCharacter(host, account, character)
+  requires: character.account = account
+  requires: not character.forceRename
+  requires: not character.online
+  requires: not ModerationLocked(account)
+  ensures: CharacterActionResolved(host, character, enter)
+}
+
+rule SelectCharacterTakeover {
+  when: SubmitSelectCharacter(host, account, character)
+  requires: character.account = account
+  requires: not character.forceRename
+  requires: character.online
+  requires: not ModerationLocked(account)
+  ensures: CharacterActionResolved(host, character, takeover)
+}
+
+-- A forced-rename character cannot be selected at all: the rename must happen
+-- first. This is the rule the entry button's disabled state mirrors.
+rule SelectCharacterDisabledByForceRename {
+  when: SubmitSelectCharacter(host, account, character)
+  requires: character.account = account
+  requires: character.forceRename
+  ensures: CharacterActionResolved(host, character, disabled)
+}
+
+-- The world-entry handshake: the session and character must resolve, the
+-- account clear moderation, the character not be force-renamed, the realm under
+-- its admission cap, and the per-IP hard limit clear. A fresh entry acquires a
+-- load lease; a resume of an existing in-world or linkdead session reuses its
+-- slot. Staff bypass the realm cap and the per-IP limit.
+rule EnterWorldHandshake {
+  when: SubmitEnterWorld(host, account, character, token, ip)
+  let session = Session where Session.token = token
+  requires: session != null
+  requires: session.revoked = false
+  requires: session.expiresAt > now
+  requires: session.scope = full
+  requires: session.account = account
+  requires: character.account = account
+  requires: not ModerationLocked(account)
+  requires: not character.forceRename
+  requires: IpConnections(ip) < MAX_WS_PER_IP_HARD or IsStaff(account)
+  if character.online:
+    ensures: PlanResume(host, character)
+  else:
+    requires: RealmFreshAdmissions(realm) < MAX_PLAYERS_PER_REALM or IsStaff(account)
+    let nonce = FreshNonce()
+    requires: not exists CharacterLease where CharacterLease.character = character and CharacterLease.released = false and CharacterLease.expiresAt > now and not (CharacterLease.holder = account)
+    ensures: CharacterLease.created(character = character, holder = account, nonce = nonce, acquiredAt = now, expiresAt = now + CHARACTER_LEASE_TTL, released = false)
+    ensures: character.enteringWorld = true
+}
+
+-- A character lease expires after its TTL. An expired lease no longer fences a
+-- fresh acquire.
+rule ExpireCharacterLease {
+  when: l: CharacterLease.expiresAt <= now
+  requires: l.released = false
+  ensures: l.released = true
+}
+
+------------------------------------------------------------
+-- Desktop login handoff rules
+------------------------------------------------------------
+
+-- A logged-in browser session mints a short-lived, single-use, IP-bound code
+-- the desktop shell trades for a full session. A read token cannot mint one
+-- (no scope escalation).
+rule CreateDesktopLoginCode {
+  when: SubmitDesktopLoginCreate(host, account, ip)
+  let session = ActiveSession(host)
+  requires: session != null
+  requires: session.scope = full
+  requires: not ModerationLocked(account)
+  let code = FreshCode()
+  ensures: DesktopLoginCode.created(account = account, code = code, ip = ip, issuedAt = now, expiresAt = now + DESKTOP_LOGIN_TTL, consumed = false)
+}
+
+-- The desktop shell trades the code for a full session. The code is the
+-- credential: it must be unconsumed, unexpired, and IP-bound, and the account
+-- must clear moderation.
+rule ExchangeDesktopLoginCode {
+  when: SubmitDesktopLoginExchange(host, code, ip)
+  let entry = DesktopLoginCode where DesktopLoginCode.code = code
+  requires: entry != null
+  requires: entry.consumed = false
+  requires: entry.expiresAt > now
+  requires: entry.ip = ip
+  requires: not ModerationLocked(entry.account)
+  ensures: entry.consumed = true
+  ensures: IssueSession(host, account = entry.account, scope = full, issuedBy = password)
+}
+
+------------------------------------------------------------
+-- Account self-service rules
+------------------------------------------------------------
+
+-- Change the password: re-verify the current one, rotate the hash, keep this
+-- device, sign out every other. The caller token is always non-null here (the
+-- mutation gate already validated it).
+rule ChangePassword {
+  when: SubmitChangePassword(host, account, current, next, callerToken)
+  requires: not AccountThrottled(account.username)
+  requires: VerifyPassword(account.passwordHash, current)
+  requires: ValidPassword(next)
+  ensures: account.passwordHash = HashPassword(next)
+  ensures: account.passwordSet = true
+  for s in Session where Session.account = account and s.token != callerToken and s.revoked = false:
+    ensures: s.revoked = true
+}
+
+-- Request a password reset: identify by username, mail a reset link to the
+-- recovery address if there is one. The response is identical on every path
+-- (unknown user, known but no email, success) so it never reveals whether the
+-- account exists.
+rule RequestPasswordReset {
+  when: SubmitPasswordReset(host, username)
+  let account = Account where Account.username = username
+  if account != null and account.email != null and account.email != "":
+    let token = FreshToken()
+    ensures: PasswordResetRequest.created(account = account, tokenHash = HashToken(token), expiresAt = now + PASSWORD_RESET_TTL, consumed = false)
+    ensures: ResetLinkMailed(host, account.email, token)
+  ensures: ResetAcknowledged(host)
+}
+
+-- Confirm a reset: apply the token, rotate the password, revoke every session.
+-- Invalid and expired tokens return the same refusal so neither leaks.
+rule ConsumePasswordReset {
+  when: SubmitPasswordResetConfirm(host, token, next)
+  let req = PasswordResetRequest where PasswordResetRequest.tokenHash = HashToken(token)
+  requires: req != null
+  requires: req.consumed = false
+  requires: req.expiresAt > now
+  requires: ValidPassword(next)
+  ensures: req.consumed = true
+  ensures: req.account.passwordHash = HashPassword(next)
+  ensures: req.account.passwordSet = true
+  for s in Session where Session.account = req.account and s.revoked = false:
+    ensures: s.revoked = true
+}
+
+-- Deactivate: re-confirm username and password, require every character
+-- offline, lock the account, revoke every session, and tear down any live
+-- socket. The lock is reversible only by an admin.
+rule DeactivateAccount {
+  when: SubmitDeactivate(host, account, username, password)
+  requires: not AccountThrottled(account.username)
+  requires: account.username = username
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: not AnyCharacterOnline(account)
+  ensures: account.deactivated = true
+  for s in Session where Session.account = account and s.revoked = false:
+    ensures: s.revoked = true
+  ensures: AccountDisconnected(host, account)
+}
+
+-- Set the recovery email on an account that has none. The bearer session IS the
+-- authorization: no existing address is at risk, so no password re-check. The
+-- address is stored unverified. Once an address exists it can only move through
+-- the verified change flow.
+rule SetInitialEmail {
+  when: SubmitSetInitialEmail(host, account, email)
+  let normEmail = NormalizeEmail(email)
+  requires: normEmail != null
+  requires: account.email = null or account.email = ""
+  ensures: account.email = normEmail
+  ensures: account.emailVerified = false
+}
+
+-- Request a verified email change: re-verify the password, mail a one-time
+-- verify link to the new address. The address moves only on verify.
+rule RequestEmailChange {
+  when: SubmitEmailChange(host, account, password, newEmail)
+  let normEmail = NormalizeEmail(newEmail)
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: normEmail != null
+  requires: normEmail != account.email
+  let token = FreshToken()
+  ensures: EmailChangeRequest.created(account = account, newEmail = normEmail, tokenHash = HashToken(token), expiresAt = now + EMAIL_CHANGE_TTL, consumed = false)
+  ensures: ChangeLinkMailed(host, normEmail, token)
+}
+
+-- Verify the email change: the one-time token is the authorization. Invalid
+-- and expired tokens return the same refusal.
+rule VerifyEmailChange {
+  when: SubmitEmailVerify(host, token)
+  let req = EmailChangeRequest where EmailChangeRequest.tokenHash = HashToken(token)
+  requires: req != null
+  requires: req.consumed = false
+  requires: req.expiresAt > now
+  ensures: req.consumed = true
+  ensures: req.account.email = req.newEmail
+  ensures: req.account.emailVerified = true
+}
+
+------------------------------------------------------------
+-- Two-factor setup rules
+------------------------------------------------------------
+
+-- Setup mints a pending secret (not yet enforced) after a password re-check.
+-- Idempotent: re-running before enabling supersedes the previous pending
+-- secret.
+rule SetupTotp {
+  when: SubmitTotpSetup(host, account, password)
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: account.totpEnabledAt = null
+  let secret = FreshSecret()
+  ensures: account.totpPendingSecret = secret
+}
+
+-- Enable confirms a live code against the pending secret, promotes it, and
+-- arms the second factor. Recovery codes are minted once, at enable.
+rule EnableTotp {
+  when: SubmitTotpEnable(host, account, code)
+  requires: account.totpEnabledAt = null
+  requires: account.totpPendingSecret != null
+  requires: VerifyTotpCode(account.totpPendingSecret, code) != null
+  ensures: account.totpEnabledAt = now
+  ensures: account.totpPendingSecret = null
+  ensures: RecoveryCodesIssued(host, account)
+}
+
+-- Disable clears the secret and all recovery codes after a password re-check.
+rule DisableTotp {
+  when: SubmitTotpDisable(host, account, password)
+  requires: VerifyPassword(account.passwordHash, password)
+  requires: account.totpEnabledAt != null
+  ensures: account.totpEnabledAt = null
+  ensures: account.totpLastWindow = 0
+  ensures: RecoveryCodesCleared(account)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A request is authenticated only by a live, unexpired, scope-matching token.
+-- A revoked or expired token is worthless, and a read token can never authorize
+-- a mutation.
+invariant SessionIsTheOnlyCredential {
+  for s in Session:
+    s.revoked = false and s.expiresAt > now implies Authenticates(s)
+  for s in Session:
+    s.revoked = true implies not Authenticates(s)
+  for s in Session:
+    s.expiresAt <= now implies not Authenticates(s)
+  for s in Session:
+    s.scope = read implies not AuthorizesMutation(s)
+}
+
+-- Only password, apple, and discord establish an identity and mint a session.
+-- github and steam links NEVER issue a credential; a steam or github link is a
+-- pointer, not a login path.
+invariant OnlyLoginProvidersMintSessions {
+  for s in Session:
+    s.issuedBy = password or s.issuedBy = apple or s.issuedBy = discord
+  for l in LinkedProvider:
+    l.kind = github implies not IssuesCredential(l)
+  for l in LinkedProvider:
+    l.kind = steam implies not IssuesCredential(l)
+}
+
+-- Steam is a MIRROR, never an authority. Nothing in the Steam path calls the
+-- session issuer, reads or writes a session row, or treats a steam link as an
+-- identity source. A steam link only points outward at the achievement mirror.
+invariant SteamIsMirrorNotAuthority {
+  for l in LinkedProvider where l.kind = steam:
+    not SessionExistsFor(l)
+  for l in LinkedProvider where l.kind = steam:
+    MirrorOnly(l)
+}
+
+-- A provider subject maps to at most one account. Two accounts can never link
+-- the same verified subject id; the unique guard closes the race.
+invariant ProviderSubjectIsUnique {
+  for l in LinkedProvider:
+    Count(LinkedProvider where l.kind = LinkedProvider.kind and l.subjectId = LinkedProvider.subjectId) <= 1
+}
+
+-- A character belongs to exactly one account on exactly one realm. A cross
+-- account or cross realm read is indistinguishable from a miss (anti
+-- enumeration).
+invariant CharacterScopedToAccountAndRealm {
+  for c in Character:
+    c.account != null and c.realm != null
+  for c in Character:
+    ReadOf(c) by caller implies caller = c.account
+}
+
+-- An account holds at most CHARACTER_LIMIT characters per realm. The cap is
+-- enforced at create; a over-cap request creates nothing.
+invariant CharacterCapPerRealm {
+  for a in Account:
+    for r in RealmName:
+      Count(Character where Character.account = a and Character.realm = r) <= CHARACTER_LIMIT
+}
+
+-- A character name is globally unique among active accounts. A name held only
+-- by a deactivated account is reclaimable; otherwise a collision is refused.
+invariant CharacterNameGloballyUnique {
+  for c in Character:
+    Count(Character where Character.name = c.name and AccountOf(Character).deactivated = false) <= 1
+}
+
+-- A force-rename character cannot enter the world. The entry resolves to
+-- disabled until the rename clears the flag.
+invariant ForceRenameBlocksEntry {
+  for c in Character where c.forceRename:
+    not EntersWorld(c)
+}
+
+-- At most one live character lease per character within its TTL. Two processes
+-- can never double-load one character; the owner may reclaim its own stranded
+-- lease before TTL.
+invariant CharacterLeaseIsExclusive {
+  for c in Character:
+    Count(CharacterLease where CharacterLease.character = c and CharacterLease.released = false and CharacterLease.expiresAt > now) <= 1
+  for l in CharacterLease where l.released = false and l.expiresAt > now:
+    ReacquireByOwner(l) implies l.holder = l.character.account
+}
+
+-- A fresh world entry is refused once the realm is at its admission cap. A
+-- resume reuses an existing slot and staff bypass the cap; the cap is checked
+-- against live sessions plus in-flight fresh admissions so racing handshakes
+-- cannot admit past it.
+invariant RealmAdmissionCapped {
+  for r in RealmName:
+    FreshAdmissions(r) <= MAX_PLAYERS_PER_REALM or StaffBypassed(r)
+}
+
+-- A two-factor code is replay guarded: within its window a code is good for at
+-- most one login. The window counter only moves forward.
+invariant TwoFactorReplayGuarded {
+  for a in Account where a.totpEnabledAt != null:
+    a.totp.lastWindow = MaxWindowAccepted(a)
+  for a in Account:
+    a.totp.lastWindow implies MonotonicNonDecreasing(a.totp.lastWindow)
+}
+
+-- A pending provider login token is single use and TTL bounded. A consumed or
+-- expired token links nothing.
+invariant PendingLoginSingleUse {
+  for p in PendingProviderLogin:
+    p.consumed = true implies not CanChoose(p)
+  for p in PendingProviderLogin:
+    p.expiresAt <= now implies not CanChoose(p)
+}
+
+-- A password reset and an email change token are each single use and TTL
+-- bounded. A consumed or expired token changes nothing.
+invariant EmailTokenSingleUse {
+  for r in PasswordResetRequest:
+    r.consumed = true implies not CanReset(r)
+  for r in PasswordResetRequest:
+    r.expiresAt <= now implies not CanReset(r)
+  for r in EmailChangeRequest:
+    r.consumed = true implies not CanChangeEmail(r)
+  for r in EmailChangeRequest:
+    r.expiresAt <= now implies not CanChangeEmail(r)
+}
+
+-- A desktop login code is single use, IP-bound, and TTL bounded. A consumed,
+-- expired, or IP-mismatched code trades for nothing.
+invariant DesktopLoginCodeSingleUse {
+  for d in DesktopLoginCode:
+    d.consumed = true implies not CanExchange(d)
+  for d in DesktopLoginCode:
+    d.expiresAt <= now implies not CanExchange(d)
+  for d in DesktopLoginCode:
+    ExchangedFromIp(d) implies ExchangedFromIp(d) = d.ip
+}
+
+-- Account existence and account state never leak through the auth surface. The
+-- password reset request, the unsubscribe, and the invalid credentials
+-- responses are identical on every path so a probing caller learns nothing.
+invariant AntiEnumeration {
+  for a in Account:
+    Probe(a) implies IndistinguishableResponse(a)
+}
+
+-- Deactivation locks the account and revokes every session. A deactivated
+-- account authenticates nothing until an admin reactivates it.
+invariant DeactivationRevokesAllSessions {
+  for a in Account where a.deactivated = true:
+    not exists s in Session where s.account = a and s.revoked = false
+  for a in Account where a.deactivated = true:
+    not AuthenticatesAny(a)
+}

@@ -1,0 +1,600 @@
+-- allium: 3
+-- i18n.allium
+-- Scope: the t() translation contract, the sparse-overlay catalog model, the two-tier release gate, the lazy per-locale resident map, and the S3 sim/server text re-localization flow that keeps the deterministic core language-agnostic while every player-visible string is still a t() key.
+-- Includes: TranslationKey, Locale, Params, LocalizedText, SimTextEmit, ReleaseTier, LoadStatus, RowStatus, TextOrigin value types; the Catalog, LocaleOverlay, ResolvedTable, PendingRow, BlockedRow, ResidentLocale, PlayerRenderSink, and DeterministicCore external entities; the TranslationLookup (t()), SimTextMatcher (S3), LocaleLoader (lazy), and LocalizedFormatter contracts; the PlayerTextBoundary surface; the ResolveKey, PrefetchLocale, LoadLocaleLazy, BuildResolvedTable, GateOnPending, ReLocalizeSimText, and FormatLocalizedNumber rules; the every-player-string-is-a-key, rendered-text-never-concatenates, english-is-universal-fallback, active-locale-resident-before-first-paint, lookup-stays-synchronous, untracked-key-throws-in-dev, pending-key-hard-fails-on-release, release-has-no-pending, contributor-adds-english-only, overlay-never-fakes-a-translation, sim-never-holds-localized-text, every-sim-emit-recognized-by-matcher, reword-stays-translated-blind-spot, resolved-table-deterministic, and pseudo-locale-dev-only invariants.
+-- Excludes: the specific English string values and the 22 locale codes (data, not behaviour); the HUD/render code that calls t() (the hud spec owns where the sink is painted); the JSON/TS module mechanics of the catalog files and the generated resolved-table emit shape (file format, not contract); the build script internals (i18n_build / i18n_scan / i18n_admin_build) beyond their observable merge/pending/gate effect; the talent_i18n and deed_i18n procedural description generators (their own matcher concern); the Intl.NumberFormat / DateTimeFormat caching logs; the admin dashboard i18n runtime (a structural mirror with deferred lazy loading, modelled only by parity); the locked-terms glossary content; and the hreflang and language picker UI plumbing.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A dotted-path key into the English catalog. The TranslationKey type union is
+-- generated from the catalog's English leaves, so a key not in the catalog is a
+-- type error the runtime additionally throws on. This is the single handle
+-- every player-visible string resolves through.
+value TranslationKey {
+    path: String
+}
+
+-- A supported locale code. English is the source and the universal fallback;
+-- every non-English code has its own sparse overlay and loads lazily. A dialect
+-- code (es_ES, fr_CA, en_CA) carries its base code and resolves to it at build
+-- time, so each ships as a standalone dense table with no runtime composition.
+value Locale {
+    code: String
+    base_code: String
+}
+
+-- Interpolation parameters spliced into a template's {placeholder} tokens, and
+-- the structured values carried alongside a sim/server text emit. Rendered text
+-- never concatenates English or builds these by hand; values pass through.
+value Params {
+    bag: Map<String, String>
+}
+
+-- A localized string ready to render. The output of the t() contract and the
+-- S3 matcher; the only thing the render sink is ever handed.
+value LocalizedText {
+    text: String
+}
+
+-- The stable payload the deterministic core (sim) or the authoritative server
+-- emits when they need to surface player text: the canonical English string
+-- (the matcher recognition key) plus the structured values to splice. The core
+-- never holds localized text; this is the wire shape the client re-localizes.
+value SimTextEmit {
+    origin: TextOrigin
+    english: String
+    values: Params
+}
+
+-- Which tier the gate is running under, read off the git ref and the env flag.
+-- PR tier permits English-only (pending rows pass); release tier hard-fails on
+-- any pending row. The determinism and completeness guarantees hold at both.
+enum ReleaseTier {
+    pr
+    | release
+}
+
+-- The load state of a non-English locale's dense table in the runtime resident
+-- map. English is always resident (eager). A failed load clears the in-flight
+-- slot so a retry can start a fresh import.
+enum LoadStatus {
+    absent
+    | loading
+    | resident
+    | failed
+}
+
+-- The registry status of one (locale, key) row in the resolved table. The
+-- release gate asserts no row is pending; blocked rows are English-by-design
+-- (cognates, command-reference dumps) and pass at both tiers.
+enum RowStatus {
+    translated
+    | pending
+    | blocked
+}
+
+-- Which language-agnostic layer emitted a player-facing string. Drives which
+-- matcher dictionary the client consults; the S3 guard accepts recognition by
+-- any of the three client matcher layers regardless of origin.
+enum TextOrigin {
+    sim
+    | server
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The presentation layer that renders player-visible text: the HUD, the
+-- homepage shell, the admin dashboard, static HTML, document.title. It is the
+-- ONLY caller of t() and the formatters, and it never receives raw English
+-- from the deterministic core, only re-localized LocalizedText.
+entity PlayerRenderSink {
+    tier: ReleaseTier
+}
+
+-- The deterministic sim core and the authoritative server. They stay
+-- language-agnostic: no t(), no DOM, no localized text held in state. Player
+-- text leaves them only as a SimTextEmit (stable English id plus values) or a
+-- code, which the client re-localizes. The server is the source of truth for
+-- every outcome; the client never decides what a string says.
+entity DeterministicCore {
+    holds_localized_text: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The authoritative English source catalog. Its leaf paths ARE the
+-- TranslationKey universe (the generated type union derives from them). New
+-- player strings land here first; the maintainer fills every locale from this.
+entity Catalog {
+    language: Locale
+    keys: Set<TranslationKey>
+}
+
+-- One non-English locale's sparse overlay: the subset of catalog keys this
+-- locale has actually translated. The ONLY surface a translator edits. A key
+-- absent here is English-filled in the resolved table and marked pending.
+entity LocaleOverlay {
+    language: Locale
+    translated: Set<TranslationKey>
+}
+
+-- The dense per-locale table the runtime reads. Every catalog key has an entry
+-- (missing overlay keys are English-filled). The dense map is the completeness
+-- face; the per-key pending/blocked status lives on PendingRow / BlockedRow.
+entity ResolvedTable {
+    language: Locale
+    dense: Map<TranslationKey, LocalizedText>
+    byte_identical_on_regen: Boolean
+}
+
+-- One (locale, key) row the registry marks pending: the overlay omitted it, so
+-- the resolved table English-filled it. The release gate asserts none exist;
+-- the t() release backstop throws on any read of one. Modelled as its own
+-- entity so the gate counts rows directly.
+entity PendingRow {
+    language: Locale
+    key: TranslationKey
+    status: RowStatus
+}
+
+-- A (locale, key) row whose translation is byte-identical to English on
+-- purpose (a true cognate, a brand leaf, a /command reference dump). Without
+-- the explicit allow-list the release-tier copied-English guard would flag it.
+entity BlockedRow {
+    language: Locale
+    key: TranslationKey
+    reason: String
+}
+
+-- One slot in the runtime resident map. English is resident from boot (the
+-- eager default and the universal synchronous fallback); every non-English
+-- locale transitions absent -> loading -> resident on demand. A loading locale
+-- coalesces concurrent callers onto one in-flight import; a failed load clears
+-- the slot so a retry starts fresh.
+entity ResidentLocale {
+    language: Locale
+    status: LoadStatus
+    table: ResolvedTable
+
+    transitions status {
+        absent -> loading
+        loading -> resident
+        loading -> failed
+        failed -> loading
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    SOURCE_LANGUAGE_CODE: String = "en"
+    PSEUDO_LOCALE_CODE: String = "en_XA"
+    NON_LATIN_PR_FILL_CODES: Set<String> = { "zh_CN", "zh_TW", "ja_JP", "ko_KR", "ru_RU" }
+    WORDY_RUN_LENGTH: Integer = 4
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The t() lookup contract: the single synchronous handle every player-visible
+-- string resolves through. Reads the active locale's resident table,
+-- interpolates {placeholder} params, and enforces the untracked-key and
+-- pending-key backstops. Stays synchronous forever (an async t() would force
+-- await through every render call site and is a timing hazard), so the active
+-- locale's table MUST be resident before the first localized paint.
+contract TranslationLookup {
+    t: (key: TranslationKey, params: Params) -> LocalizedText
+    tOptional: (key: TranslationKey, params: Params) -> LocalizedText?
+    hasTranslation: (key: TranslationKey) -> Boolean
+
+    @invariant EveryPlayerStringIsKey
+        -- Every player-visible string rendered by any sink is the result of a
+        -- t() lookup (or a formatter), never a hard-coded literal, an English
+        -- concat, or a '?? English' fallback. Accessible names, aria/alt,
+        -- toasts, dialogs, validation and connection errors, document.title,
+        -- and server-sent player text are all t() keys.
+
+    @invariant RenderedTextNeverConcatenates
+        -- Rendered text is never built by concatenating fragments or falling
+        -- back to English inline. Reordering per locale belongs in a t() key
+        -- with the variable parts spliced as {placeholder} params.
+
+    @invariant LookupIsSynchronous
+        -- t() never awaits. The active locale's dense table is resident before
+        -- the first t() call that needs it fires; the only async surface in
+        -- the i18n runtime is the locale loader.
+
+    @invariant UntrackedKeyThrowsInDev
+        -- A key absent from the catalog (a typo or a never-registered key)
+        -- throws on a non-release build so it surfaces immediately; on a
+        -- release build it degrades to the raw key rather than crash a player.
+
+    @invariant PendingKeyHardFailsOnRelease
+        -- A pending key read on a release build throws. English must never
+        -- silently ship to a translated player; the release gate's empty
+        -- pending assertion is the primary guard, this is the never-fires
+        -- backstop.
+}
+
+-- The S3 re-localization contract. The deterministic core and the server emit
+-- player text as a stable English id plus values (a SimTextEmit) because they
+-- stay language-agnostic; the client matcher turns that into a t() key in the
+-- active locale. Three matcher layers run in order (hud-local, then server,
+-- then sim); recognition by ANY layer satisfies the guard.
+contract SimTextMatcher {
+    localize: (emit: SimTextEmit) -> LocalizedText?
+
+    @invariant SimNeverHoldsLocalizedText
+        -- The deterministic core and the server never hold or emit localized
+        -- text. Player text leaves them as a stable English id plus structured
+        -- values (or a code), which the client re-localizes at render time.
+
+    @invariant EverySimEmitRecognizedByMatcher
+        -- Every player-facing emit the guard can see in the core or the server
+        -- is recognized by at least one client matcher layer or is on a
+        -- documented English-by-design backstop. A new unhandled emit cannot
+        -- ship silently; the S3 guard fails the build.
+}
+
+-- The lazy per-locale loader. English is eager and always resident; every
+-- non-English locale's dense table loads on demand as its own chunk. Loading
+-- is idempotent and coalesces concurrent callers onto one in-flight import;
+-- failure fails soft to English (the universal fallback) and clears the slot
+-- for retry.
+contract LocaleLoader {
+    ensureResident: (locale: Locale) -> Void
+    isResident: (locale: Locale) -> Boolean
+
+    @invariant EnglishAlwaysResident
+        -- The English dense table is resident from boot. It is the default
+        -- locale and the universal synchronous fallback: a read for a locale
+        -- not yet resident (or whose chunk failed) returns English, never
+        -- blocks, and never throws.
+
+    @invariant ActiveLocaleResidentBeforeFirstPaint
+        -- The active locale's table is resident before the first localized
+        -- paint and before a live switch flips the current language, so no
+        -- mixed-language intermediate frame is ever visible.
+
+    @invariant FailureDegradesToEnglish
+        -- A locale chunk that fails to load (offline, a 404 after a bad deploy)
+        -- never crashes the client and never blocks a render. The app boots or
+        -- continues in English with a non-blocking toast; the user can retry.
+}
+
+-- Numbers, money, dates, durations, percents, and coordinates are never hand
+-- built. They route through Intl formatters keyed on the active locale so the
+-- grouping, separators, plural form, and calendar are correct per language.
+contract LocalizedFormatter {
+    formatNumber: (value: Integer, locale: Locale) -> LocalizedText
+    formatMoney: (copper: Integer, locale: Locale) -> LocalizedText
+    formatDateTime: (instant: Timestamp, locale: Locale) -> LocalizedText
+    formatDuration: (seconds: Integer, locale: Locale) -> LocalizedText
+
+    @invariant NeverHandBuiltNumber
+        -- Every user-visible number, date, percent, coordinate, and duration is
+        -- produced by a formatter, never assembled by string concatenation.
+        -- Units and separators that reorder per locale live in a t() key with
+        -- the digits spliced as a placeholder.
+}
+
+------------------------------------------------------------
+-- Surface
+------------------------------------------------------------
+
+-- The boundary every player-visible string crosses. The render sink is the
+-- only caller of t() and the formatters; the deterministic core hands it
+-- SimTextEmits, never localized text. Identity is not modelled here: the sink
+-- only ever renders LocalizedText resolved inside the i18n runtime.
+surface PlayerTextBoundary {
+    facing sink: PlayerRenderSink
+    context catalog: Catalog
+
+    exposes:
+        catalog.keys
+
+    provides:
+        RenderString(sink, key, params)
+        RenderSimText(sink, emit)
+        RenderNumber(sink, value, locale)
+        SwitchLanguage(sink, locale)
+        BuildResolved(catalog, overlay)
+        RunGate(tier, pending)
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The t() lookup. Reads the active locale's resident table, interpolates
+-- params, and enforces the two backstops. An untracked key throws in dev and
+-- degrades to the raw key on release; a pending key on a release build throws
+-- (the never-fires backstop, since the gate already emptied pending).
+rule ResolveKey {
+    when: RenderString(sink, key, params)
+    let lang = ActiveLanguage()
+    let slot = ResidentSlotFor(lang)
+    let table = slot.table
+    let value = EntryFor(table.dense, key)
+    if value = null:
+        if sink.tier = release:
+            ensures: RenderedRawKey(sink, key)
+        else:
+            ensures: ThrewUntrackedKey(key)
+    else:
+        if IsPending(table, key) and sink.tier = release:
+            ensures: ThrewPendingKey(lang, key)
+        else:
+            ensures: RenderedLocalized(sink, LocalizedText{ text: Interpolate(value.text, params.bag) })
+}
+
+-- A locale's chunk fetch starts as early as module evaluation (fire-and-forget)
+-- so the network request is in flight before the bootstrap await reaches it.
+-- English and an already-resident locale are no-ops; never speculative (only
+-- the one active locale, never the others).
+rule PrefetchLocale {
+    when: ModuleEval(locale)
+    if locale.code = config.SOURCE_LANGUAGE_CODE:
+        ensures: Noop(locale)
+    else:
+        if IsResident(locale):
+            ensures: Noop(locale)
+        else:
+            ensures: PrefetchInflight(locale)
+}
+
+-- A non-English locale's dense table loads on demand. Idempotent: an already
+-- resident locale, or one with an in-flight load, is a coalesced no-op. The
+-- table becomes resident on success; a failure clears the slot for retry and
+-- leaves English as the effective table.
+rule LoadLocaleLazy {
+    when: SwitchLanguage(sink, locale)
+    requires: locale.code != config.SOURCE_LANGUAGE_CODE
+    let slot = ResidentSlotFor(locale)
+    if slot.status = resident:
+        ensures: Noop(locale)
+    else:
+        if slot.status != loading:
+            ensures: slot.status = loading
+            let loaded = LoadChunk(locale)
+            if loaded.ok:
+                ensures: ResidentLocale.created(language: locale, status: resident, table: loaded.table)
+            else:
+                ensures: slot.status = failed
+                ensures: LocaleLoadFailedSoft(locale)
+}
+
+-- The build merges the English catalog and a locale's sparse overlay into one
+-- dense table. Every catalog key gets an entry; a key the overlay translated
+-- takes its text, a key the overlay omitted is English-filled and recorded as
+-- a PendingRow; a cognate or command-reference key is recorded as a BlockedRow.
+-- The output is byte-identical on regeneration (the determinism anchor).
+rule BuildResolvedTable {
+    when: BuildResolved(catalog, overlay)
+    for key in catalog.keys:
+        if key in overlay.translated:
+            ensures: RowTranslated(overlay.language, key, OverlayText(overlay, key))
+        else:
+            if IsEnglishByDesign(key):
+                ensures: BlockedRow.created(language: overlay.language, key: key, reason: ReasonFor(key))
+            else:
+                ensures: RowEnglishFilled(overlay.language, key, EnglishFor(catalog, key))
+                ensures: PendingRow.created(language: overlay.language, key: key, status: pending)
+    ensures: ResolvedTable.created(
+        language: overlay.language,
+        dense: Merged(catalog, overlay),
+        byte_identical_on_regen: true
+    )
+}
+
+-- The two-tier gate. At PR tier pending rows pass (English-only is legal); at
+-- release tier a single pending row fails the build. The always-on M16 check
+-- adds one PR-tier exception: a new wordy English value (a run of WORDY_RUN_LENGTH+
+-- lowercase letters after stripping tokens) also needs its five non-Latin fills
+-- in the same change, or untranslated English left in a non-Latin locale leaks.
+rule GateOnPending {
+    when: RunGate(tier, pending)
+    if tier = release:
+        requires: PendingRowCount() = 0
+        ensures: GatePassed(tier)
+    else:
+        for row in PendingRow where row.status = pending:
+            ensures: AllowedAtPrTier(row)
+        for key in NewWordyKeys(ActiveCatalog(), config.WORDY_RUN_LENGTH):
+            requires: NonLatinFillCount(key, config.NON_LATIN_PR_FILL_CODES) >= WordyFillFloor()
+            ensures: WordyFillChecked(key)
+}
+
+-- The S3 re-localization flow. A SimTextEmit from the language-agnostic core
+-- or server is matched against the three client matcher layers in order (hud
+-- local, then server, then sim). The first recognition wins and produces a
+-- LocalizedText in the active locale; a miss is a build-time failure (the S3
+-- guard) never a silent English ship.
+rule ReLocalizeSimText {
+    when: RenderSimText(sink, emit)
+    let h = MatchHudLocal(emit)
+    if h != null:
+        ensures: RenderedLocalized(sink, LocalizedText{ text: Interpolate(h.text, emit.values.bag) })
+    else:
+        let s = MatchServer(emit)
+        if s != null:
+            ensures: RenderedLocalized(sink, LocalizedText{ text: Interpolate(s.text, emit.values.bag) })
+        else:
+            let m = MatchSim(emit)
+            requires: m != null
+            ensures: RenderedLocalized(sink, LocalizedText{ text: Interpolate(m.text, emit.values.bag) })
+}
+
+-- A user-visible number routes through the active locale's Intl.NumberFormat.
+-- Money, dates, and durations share the same path (units that reorder per
+-- locale live in a t() key with digits spliced as a placeholder). Never hand
+-- built.
+rule FormatLocalizedNumber {
+    when: RenderNumber(sink, value, locale)
+    let formatted = IntlNumber(locale, value)
+    ensures: RenderedLocalized(sink, formatted)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The absolute core invariant. Every player-visible string, in every render
+-- sink (HUD, shell, admin, static HTML, document.title, server-sent player
+-- text), is the result of a t() lookup or a formatter. No hard-coded literal
+-- is renderable. tsc (the TranslationKey type) and the t() untracked-key
+-- throw enforce it; the en_XA pseudo-locale catches what tsc cannot see.
+invariant EveryPlayerStringIsKey {
+    for s in PlayerRenderSink:
+        for r in RenderedStringOn(s):
+            r.from_t_lookup = true or r.from_formatter = true
+}
+
+-- Rendered text is never concatenated from fragments and never falls back to
+-- English inline. Reordering per locale lives in the key; variable parts are
+-- {placeholder} params.
+invariant RenderedTextNeverConcatenates {
+    for s in PlayerRenderSink:
+        for r in RenderedStringOn(s):
+            not Concatenated(r) and not EnglishFallbackInline(r)
+}
+
+-- English is the source, the eager default, and the universal synchronous
+-- fallback. It is resident from boot and never leaves the resident map; a read
+-- for any not-yet-resident locale resolves to it.
+invariant EnglishIsUniversalFallback {
+    let en = ResidentLocale where en.language.code = config.SOURCE_LANGUAGE_CODE
+    en.status = resident
+    for slot in ResidentLocale where slot.status != resident:
+        ReadResolvesToEnglish(slot)
+}
+
+-- The active locale's table is resident before the first localized paint and
+-- before a live switch flips the current language, so no mixed-language
+-- intermediate frame is ever visible and t() never reads a half-loaded table.
+invariant ActiveLocaleResidentBeforeFirstPaint {
+    for s in PlayerRenderSink:
+        FirstPaint(s) implies (ResidentLocale where language = ActiveLanguage() and status = resident) != null
+    for s in PlayerRenderSink:
+        LanguageFlipped(s) implies (ResidentLocale where language = NewLanguage(s) and status = resident) != null
+}
+
+-- t() never awaits. The active table is resident before any t() fires; the
+-- only async surface is the locale loader, awaited at the bootstrap and the
+-- picker, never inside the lookup.
+invariant LookupIsSynchronous {
+    for k in TranslationKey:
+        SynchronousOnRead(k)
+}
+
+-- A key absent from the catalog throws on a non-release build (immediate
+-- signal of a typo or a never-registered key) and degrades to the raw key on a
+-- release build (never crash a player mid-render).
+invariant UntrackedKeyThrowsInDev {
+    for k in TranslationKey:
+        (k in Catalog.keys) or (PlayerRenderSink.tier = release and DegradesToRaw(k)) or Throws(k)
+}
+
+-- A pending key read on a release build throws. English must never silently
+-- ship to a translated player; the gate's empty-pending assertion is primary,
+-- this is the never-fires backstop.
+invariant PendingKeyHardFailsOnRelease {
+    for r in PendingRow where r.status = pending:
+        PlayerRenderSink.tier = release implies ThrowsOnRead(r.language, r.key)
+}
+
+-- At release tier the pending set is empty. A single untranslated row fails
+-- the release gate; full-locale completeness is mandatory at the only point it
+-- matters (shipping to players).
+invariant ReleaseHasNoPending {
+    for r in PendingRow:
+        PlayerRenderSink.tier = release implies r.status != pending
+}
+
+-- A blocked row (byte-identical to English on purpose) is on the explicit
+-- copied-English allow-list with a recorded reason: a true cognate, a brand
+-- leaf, or a /command reference dump. Without the allow-list the release-tier
+-- copied-English guard would flag it; the reason is the audit trail.
+invariant BlockedRowsAreAllowListed {
+    for b in BlockedRow:
+        OnCopiedEnglishAllowList(b.key, b.language, b.reason)
+}
+
+-- Contributors add English only: a new key lands in the English catalog and
+-- renders via t(); the build English-fills every omitted overlay and marks the
+-- row pending. Translating all non-English locales per PR would drain small
+-- budget plans and bloat diffs; the maintainer batch-fills at release.
+invariant ContributorAddsEnglishOnly {
+    for k in TranslationKey where k in Catalog.keys:
+        AddedViaEnglish(k) implies NotTouchingOverlays(k)
+}
+
+-- A non-English overlay never carries English copy, a placeholder, or a TODO
+-- as a fake translation. Omitting the key is correct (it becomes pending and
+-- the gate catches it); faking it would mark the row translated and slip past
+-- the release gate with wrong text.
+invariant OverlayNeverFakesATranslation {
+    for o in LocaleOverlay:
+        for k in o.translated:
+            NotEnglishStandIn(OverlayText(o, k))
+}
+
+-- The deterministic core and the server never hold or emit localized text.
+-- Player text leaves them as a stable English id plus values (or a code); the
+-- client matcher re-localizes at render. This is what lets the same core run
+-- unchanged on three hosts and keeps the server the single source of truth.
+invariant SimNeverHoldsLocalizedText {
+    for c in DeterministicCore:
+        c.holds_localized_text = false
+}
+
+-- Every player-facing emit the S3 guard can see in the core or the server is
+-- recognized by at least one client matcher layer (hud local, server, sim) or
+-- is on a documented English-by-design backstop. A new unhandled emit fails
+-- the build; English can never ship silently through an unmatched emit.
+invariant EverySimEmitRecognizedByMatcher {
+    for e in SimTextEmit:
+        Recognized(e.origin, e.english, e.values) or OnEnglishByDesignBackstop(e.english)
+}
+
+-- The one i18n footgun with no gate behind it: the registry tracks whether a
+-- row HAS a translation, not whether that translation still matches the
+-- current English. A reworded English value keeps its rows translated, so the
+-- overlays render the OLD wording, which can state a different fact than the
+-- English. Both gates pass. Recorded as a known blind spot until a hash drift
+-- guard re-marks reworded rows pending.
+invariant RewordStaysTranslatedBlindSpot {
+    for k in TranslationKey where Reworded(k):
+        for o in LocaleOverlay where k in o.translated:
+            TranslationMatchesOldEnglish(o, k) implies not (OverlayText(o, k) = CurrentEnglish(k))
+}
+
+-- Regenerating the resolved table from the same catalog and overlays is
+-- byte-identical. Determinism rides on the committed line-item slices and
+-- their freshness diff; a second regen leaves the tree clean. Freshness (the
+-- committed slice equals what the generator produces now) and completeness
+-- (every key exists in English) are the sibling guarantees.
+invariant ResolvedTableDeterministic {
+    for t in ResolvedTable:
+        t.byte_identical_on_regen = true
+        EveryKeyPresent(t.dense, Catalog.keys)
+}
+
+-- The en_XA pseudo-locale (accented plus bracketed English, placeholders
+-- preserved) is a dev-only tool: any on-screen text that stays plain ASCII
+-- under it is a hard-coded literal that never became a t() key. It is not in
+-- the supported language set, never reaches the picker or the release gate,
+-- and is tree-shaken out of the production bundle.
+invariant PseudoLocaleDevOnly {
+    not (config.PSEUDO_LOCALE_CODE in SupportedLocaleCodes())
+    PlayerRenderSink.tier = release implies not ShippedInBundle(config.PSEUDO_LOCALE_CODE)
+}

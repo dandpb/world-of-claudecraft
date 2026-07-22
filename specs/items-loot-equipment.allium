@@ -1,0 +1,552 @@
+-- allium: 3
+-- items-loot-equipment.allium
+-- Scope: the item catalogue, per-copy item instances, loot rolling, corpse loot rights, equipment slots, set bonuses, salvage, and enchant/disenchant.
+-- Includes: Item, ItemInstance, InventorySlot, EquipmentSlot, LootTable, LootEntry, Corpse, CorpseSlot, LootRoll, ItemSet, Enchant; the RollLoot, LootItem, AutoLoot, ResolveLootRoll, Equip, Unequip, Salvage, ApplyEnchant, Disenchant rules; slot-uniqueness, draw-order, soulbind, no-double-enchant, and set-bonus-stacking invariants.
+-- Excludes: profession craft recipes and their outputs' recipe chains (professions spec), class abilities and talent modifiers (combat/classes specs), the World Market/trade/mail sinks that consume soulbound items (referenced as invariants only), vendor buy/sell pricing detail (only the sellValue/buyValue fields are modelled), the Fiesta-mode "augments" (content/augments.ts is an arena power-up system, not item augment slots; this codebase has no per-item augment slots), cosmetic skin-select events (content/skins.ts).
+
+-- The six primary stats plus armor. The shared unit for item stats, enchant
+-- bonuses, masterwork deltas, and set bonus effects. recalcPlayerStats is the
+-- sole reader of all of these; no other site derives stats.
+value Stats {
+  str: Integer,
+  agi: Integer,
+  sta: Integer,
+  int: Integer,
+  spi: Integer,
+  armor: Integer
+}
+
+value Reagent {
+  material: Item,
+  count: Integer
+}
+
+value LootEntry {
+  item: Item,
+  copper: Integer,
+  chance: Integer,
+  questId: String,
+  rollGroup: String
+}
+
+value CorpseSlot {
+  item: Item,
+  count: Integer,
+  personalFor: Set<Player>,
+  openToAll: Boolean,
+  sharedPersonal: Boolean
+}
+
+value SetBonusTier {
+  pieces: Integer,
+  effect: Stats
+}
+
+-- Static catalogue definition (data-as-code in src/sim/content/). One record
+-- per shipped item id; the id is frozen for the lifetime of every save.
+entity Item {
+  id: String,
+  kind: String,
+  slot: String,
+  quality: String,
+  requiredClass: Set<String>,
+  requiredLevel: Integer,
+  soulbound: Boolean,
+  sellValue: Integer,
+  buyValue: Integer,
+  stackSize: Integer,
+  setId: String,
+  heroicOf: String
+}
+
+-- A non-fungible per-copy payload. Absent on ordinary fungible stacks; present
+-- on signed, rolled-stat, enchanted, or character-bound copies. The presence
+-- of an instance payload is what makes a stack non-mergeable.
+entity ItemInstance {
+  base: Item,
+  rolled: Stats,
+  enchant: Enchant,
+  boundTo: Player,
+  signer: String
+}
+
+entity InventorySlot {
+  owner: Player,
+  base: Item,
+  count: Integer,
+  instance: ItemInstance
+}
+
+-- One paperdoll slot per (player, kind). Rings declare slot kind "ring" and
+-- resolve to ring1/ring2 at equip time; every other kind names its slot
+-- directly. A slot is empty when piece is null; equipping writes piece and
+-- instance, unequipping nulls both. There is no separate status field: the
+-- piece nullability IS the slot state.
+entity EquipmentSlot {
+  owner: Player,
+  kind: String,
+  piece: Item,
+  instance: ItemInstance
+}
+
+-- A mob template's ordered loot table. Iteration order is load-bearing for
+-- the deterministic rng draw order; entries never reorder.
+entity LootTable {
+  mob: MobTemplate,
+  entries: List<LootEntry>
+}
+
+-- A lootable corpse. Owner-locked to the tapper's party for LOOT_FFA_DELAY,
+-- then free-for-all. Personal and sharedPersonal slots bypass the lock.
+entity Corpse {
+  copper: Integer,
+  slots: List<CorpseSlot>,
+  tappedBy: Player,
+  party: Set<Player>,
+  ffaUnlockAt: Timestamp,
+  spawnedAt: Timestamp,
+  status: locked | open | drained,
+  transitions status { locked -> open, open -> drained, locked -> drained, terminal: drained }
+}
+
+-- An open need-greed or master-loot assignment window on a premium drop. The
+-- roll exists while it is pending; resolution (award or expire) removes it.
+entity LootRoll {
+  corpse: Corpse,
+  item: Item,
+  candidates: Set<Player>,
+  party: Set<Player>,
+  masterLooter: Player,
+  expiresAt: Timestamp
+}
+
+-- Classic "tier set": stacking bonuses at 2/3/4 equipped pieces, resolved by
+-- recalcPlayerStats on every equip/unequip.
+entity ItemSet {
+  id: String,
+  pieces: Set<Item>,
+  bonuses: List<SetBonusTier>
+}
+
+-- A flat-stat enchant applied to a specific slot kind. Reagents are consumed
+-- on apply; the bonus bakes into the target copy's instance payload.
+entity Enchant {
+  id: String,
+  targetSlot: String,
+  reagents: List<Reagent>,
+  bonus: Stats
+}
+
+entity Player {
+  id: Integer,
+  cls: String,
+  level: Integer,
+  spec: String,
+  copper: Integer,
+  equipment: Set<EquipmentSlot>,
+  inventory: Set<InventorySlot>
+}
+
+entity MobTemplate {
+  id: String,
+  loot: LootTable
+}
+
+config {
+  LOOT_FFA_DELAY: Duration = 60,
+  LOOT_ROLL_TIMEOUT: Duration = 120,
+  MASTER_LOOT_TIMEOUT: Duration = 120,
+  VENDOR_BUYBACK_LIMIT: Integer = 12,
+  CONSUME_DURATION: Duration = 18,
+  TICK_RATE: Integer = 20
+}
+
+-- LOOT ROLLING ---------------------------------------------------------------
+-- A mob death fires RollLoot against the mob's table. Entries are walked in
+-- array order; the rng stream position is load-bearing. Exclusive rollGroups
+-- draw exactly one rng.next() (on the group's first entry) and skip the rest;
+-- independent entries draw one rng.chance each; copper entries add an int draw.
+-- Heroic variants swap in place without drawing rng.
+rule RollLoot {
+  when: MobDied(mob, killer, party, contributors)
+  let table = mob.loot
+  let heroic = InstanceKind(mob) = "heroic"
+  let awarded = EmptySet()
+  let seen = EmptySet()
+  for entry in table.entries:
+    if entry.rollGroup != null:
+      if not (entry.rollGroup in seen):
+        let s = AddSet(seen, entry.rollGroup)
+        let roll = RngNext()
+        let groupWinner = PickGroupWinner(roll, entry.rollGroup, table, awarded)
+        if groupWinner != null:
+          let resolvedItem = IfHeroicSwap(heroic, groupWinner)
+          ensures: AppendSlot(corpse, resolvedItem, 1)
+          ensures: awarded = AddSet(awarded, groupWinner)
+    else if entry.questId != null:
+      let needers = QuestNeeders(contributors, entry)
+      if needers.count > 0:
+        if RngChance(entry.chance):
+          ensures: AppendPersonalSlot(corpse, entry.item, needers)
+    else:
+      if RngChance(entry.chance):
+        if entry.copper != null:
+          let gain = RngInt(entry.copper.lower, entry.copper.upper)
+          ensures: corpse.copper = corpse.copper + gain
+        if entry.item != null:
+          let flatItem = IfHeroicSwap(heroic, entry.item)
+          ensures: AppendSlot(corpse, flatItem, 1)
+  ensures: Corpse.created(copper = TotalCopper(corpse), slots = CollectedSlots(corpse), tappedBy = killer, party = party, spawnedAt = now, ffaUnlockAt = now + LOOT_FFA_DELAY, status: locked)
+}
+
+-- The single-rng-per-group partition rule, separated for analysis: one roll
+-- picks the winning entry by cumulative chance; a winner already awarded this
+-- kill falls forward to the next non-awarded entry in the same group so drop
+-- variety rises without burning a second draw. Only when every entry in the
+-- group is already awarded does the slot produce nothing.
+rule ResolveRollGroup {
+  when: RollGroupDrawn(roll, groupId, table, awarded)
+  let group = EntriesIn(table, groupId)
+  let winner = PickGroupWinner(roll, groupId, table, awarded)
+  requires: group.count > 0
+  ensures: winner != null or AllEntriesAwarded(group, awarded)
+}
+
+-- The FFA countdown: once the owner-lock lapses the shared pool opens to
+-- everyone. Personal and sharedPersonal slots ignore this entirely.
+rule CorpseFfaUnlocks {
+  when: c: Corpse.ffaUnlockAt <= now
+  requires: c.status = locked
+  ensures: c.status = open
+}
+
+-- LOOT RIGHTS AND DISTRIBUTION -----------------------------------------------
+
+-- Manual loot: take one slot off a corpse. Honors the FFA timer (a click may
+-- take a stranger's corpse once the owner-lock lapses).
+rule LootItem {
+  when: LootItem(looter, corpse, slot)
+  requires: corpse.status != drained
+  requires: WithinRange(looter, corpse)
+  requires: HasRights(looter, corpse, slot, true)
+  if slot.sharedPersonal:
+    for p in slot.personalFor:
+      ensures: GrantItem(p, slot.item, slot.count)
+    ensures: slot.count = 0
+  else:
+    let strategy = LootStrategy(corpse, slot.item)
+    if strategy = "master-loot":
+      ensures: LootRoll.created(corpse = corpse, item = slot.item, candidates = corpse.party, party = corpse.party, masterLooter = MasterLooter(corpse), expiresAt = now + MASTER_LOOT_TIMEOUT)
+    else if strategy = "need-greed":
+      ensures: LootRoll.created(corpse = corpse, item = slot.item, candidates = corpse.party, party = corpse.party, masterLooter = null, expiresAt = now + LOOT_ROLL_TIMEOUT)
+    else if strategy = "round-robin":
+      let rrWinner = RoundRobinWinner(corpse)
+      ensures: GrantItem(rrWinner, slot.item, 1)
+      ensures: slot.count = slot.count - 1
+    else:
+      ensures: GrantItem(looter, slot.item, 1)
+      ensures: slot.count = slot.count - 1
+}
+
+-- Walk-by autoloot: the passive counterpart. Identical distribution, but the
+-- FFA flag is forced false so a passive pass never grabs a stranger's corpse
+-- just because it aged out.
+rule AutoLoot {
+  when: PlayerWalkedBy(player, corpse)
+  requires: corpse.status != drained
+  requires: WithinRange(player, corpse)
+  requires: HasRights(player, corpse, AnySharedSlot(corpse), false)
+  for slot in corpse.slots:
+    if slot.personalFor.any(p = player):
+      ensures: GrantItem(player, slot.item, 1)
+      ensures: slot.count = slot.count - 1
+    else if slot.openToAll:
+      ensures: GrantItem(player, slot.item, 1)
+      ensures: slot.count = slot.count - 1
+}
+
+-- Need-greed resolution: highest Need roll wins; else highest Greed; else the
+-- slot opens to all as a CorpseSlot. A roll that times out returns the item
+-- to the corpse. Resolution removes the LootRoll entity either way.
+rule AwardLootRoll {
+  when: r: LootRoll.expiresAt <= now
+  requires: HasNeedOrGreedWinner(r)
+  let winner = HighestRoll(r)
+  ensures: GrantItem(winner, r.item, 1)
+  ensures: not exists r
+}
+
+rule ExpireLootRoll {
+  when: r: LootRoll.expiresAt <= now
+  requires: not HasNeedOrGreedWinner(r)
+  ensures: ReturnToCorpse(r.corpse, r.item)
+  ensures: not exists r
+}
+
+-- A master-loot assignment resolves to a single explicit assignment by the
+-- master looter; on timeout the item returns to the corpse.
+rule AssignMasterLoot {
+  when: Assign(masterLooter, r, candidate)
+  requires: r.masterLooter = masterLooter
+  ensures: GrantItem(candidate, r.item, 1)
+  ensures: not exists r
+}
+
+-- A corpse with no remaining copper or items, once FFA-unlocked, is drained.
+-- A pending roll keeps it lootable until the roll resolves.
+rule DrainEmptyCorpse {
+  when: c: Corpse.ffaUnlockAt <= now
+  requires: c.status = open
+  requires: c.copper <= 0
+  requires: c.slots.count = 0
+  requires: not HasPendingRoll(c)
+  ensures: c.status = drained
+}
+
+-- EQUIPMENT ------------------------------------------------------------------
+
+-- Equip a held piece into a slot. The aimed slot is re-validated against the
+-- item's declared slot (a hand-crafted packet cannot put a helm on a ring
+-- finger), and the existing piece swaps back to bags. Stats are recomputed
+-- by the sole recalcPlayerStats path. A soulbound piece binds on equip.
+rule Equip {
+  when: Equip(player, item, slot)
+  requires: item.kind = "weapon" or item.kind = "armor" or item.kind = "held_offhand"
+  requires: HeldCount(player, item) > 0
+  requires: SlotAccepts(item, slot)
+  requires: CanEquip(player.cls, item)
+  requires: player.level >= RequiredLevel(item)
+  ensures: slot.piece = item
+  if item.soulbound:
+    ensures: BindHeldCopy(player, item)
+}
+
+-- Remove the piece in a slot back to bags, leaving the slot empty. Refused
+-- when bags are full; nothing is ever force-dropped.
+rule Unequip {
+  when: Unequip(player, slot)
+  requires: slot.piece != null
+  requires: CanAddToBags(player, slot.piece)
+  ensures: slot.piece = null
+  ensures: slot.instance = null
+}
+
+-- A committed spec is the only transition that can make an already-worn
+-- offhand illegal. It benches the piece into bags without a capacity gate so
+-- a respec never destroys gear.
+rule RevalidateOffhandForSpec {
+  when: SpecCommitted(player)
+  let offhand = FindSlot(player, "offhand")
+  if offhand.piece != null:
+    requires: not CanEquipInSlot(player.cls, offhand.piece, "offhand", player.spec)
+    ensures: offhand.piece = null
+}
+
+-- Whenever equipment changes, every set's equipped-piece count is re-read and
+-- its stacking tiers re-applied by recalcPlayerStats.
+rule RecomputeSetBonuses {
+  when: EquipmentChanged(player)
+  for set in AllSets():
+    let n = CountEquipped(player, set)
+    for tier in set.bonuses:
+      if n >= tier.pieces:
+        ensures: BonusActive(player, set, tier)
+      else:
+        ensures: not BonusActive(player, set, tier)
+}
+
+-- SALVAGE AND DISENCHANT -----------------------------------------------------
+
+-- Break an equippable weapon/armor (quality at least common) into raw
+-- materials. Yield scales with quality rank, tier (derived required level
+-- bucketed at 10 per point), plus a 0/1 rng bonus; identical salvages are
+-- not perfectly deterministic.
+rule Salvage {
+  when: Salvage(player, item)
+  requires: item.kind = "weapon" or item.kind = "armor"
+  requires: item.quality != "poor"
+  requires: item.quality != null
+  requires: HeldCount(player, item) >= 1
+  let qualityIdx = QualityRank(item.quality)
+  let tierBonus = RequiredLevel(item) / 10
+  let bonus = If(RngNext() < 0.5, 0, 1)
+  let yield = qualityIdx + tierBonus + 1 + bonus
+  let material = SalvageMaterial(item.quality)
+  ensures: ConsumeOneCopy(player, item)
+  ensures: GrantItem(player, material, yield)
+}
+
+-- Apply an enchant to a HELD enchantable copy. All-or-nothing on reagents;
+-- consumes exactly one eligible (not-already-enchanted) copy and grants a
+-- freshly-instanced copy carrying the enchant's stat bonus. Existing instance
+-- stats (crafter attribution, masterwork delta, legacy rolled quality) merge
+-- additively rather than being erased.
+rule ApplyEnchant {
+  when: ApplyEnchant(player, item, enchant)
+  requires: enchant != null
+  requires: enchant.targetSlot = item.slot
+  requires: HeldEnchantableCount(player, item) >= 1
+  for reagent in enchant.reagents:
+    requires: HeldCount(player, reagent.material) >= reagent.count
+  let prior = HeldInstanceCopy(player, item)
+  let merged = MergeStats(prior.rolled, enchant.bonus)
+  ensures: ConsumeOneEnchantableCopy(player, item)
+  for reagent in enchant.reagents:
+    ensures: Consume(player, reagent.material, reagent.count)
+  ensures: ItemInstance.created(base = item, enchant = enchant, rolled = merged, boundTo = prior.boundTo, signer = prior.signer)
+  ensures: GrantInstanced(player, item)
+}
+
+-- Destroy an enchantable copy for an arcane material keyed by quality. Same
+-- yield shape as salvage plus a rng bonus unit; grants the material and bumps
+-- the enchanter's crafting skill.
+rule Disenchant {
+  when: Disenchant(player, item)
+  requires: item.kind = "weapon" or item.kind = "armor"
+  requires: item.quality != "poor"
+  requires: item.quality != null
+  requires: HeldEnchantableCount(player, item) >= 1
+  let material = DisenchantMaterial(item.quality)
+  let yield = DisenchantYield(item) + If(RngNext() < 0.5, 0, 1)
+  ensures: ConsumeOneEnchantableCopy(player, item)
+  ensures: GrantItem(player, material, yield)
+  ensures: GainEnchantingSkill(player)
+}
+
+-- INVARIANTS -----------------------------------------------------------------
+
+-- Each equipment slot holds at most one piece. A null piece is an empty
+-- slot; a non-null piece is the sole occupant. The optional instance payload
+-- travels with the piece: null piece implies null instance.
+invariant SlotUniqueness {
+  for s in EquipmentSlot:
+    s.piece = null implies s.instance = null
+}
+
+-- Inventory counts never go negative, and a fungible stack respects its
+-- item's stackSize ceiling.
+invariant CountsNonNegative {
+  for s in InventorySlot:
+    s.count >= 0
+  for s in InventorySlot:
+    s.count <= s.base.stackSize
+}
+
+-- An instanced copy is never silently merged into a plain fungible stack of
+-- the same id. This is what makes signed/rolled/enchanted/bound copies
+-- non-fungible and keeps the World Market listing path honest.
+invariant InstanceNeverMerges {
+  for s in InventorySlot:
+    s.instance != null implies s.count = 1
+}
+
+-- The deterministic draw order: a single shared rng stream feeds every loot
+-- site. rollGroup entries draw exactly one rng.next() per group (on the
+-- group's first array occurrence); independent entries draw one chance each;
+-- copper entries add an int. Reordering the table, the iteration, or an
+-- early-bail that draws rng forks the world.
+invariant LootDrawOrderIsDeterministic {
+  for t in LootTable:
+    t.mob != null
+  for t in LootTable:
+    IteratesInArrayOrder(RollLoot, t)
+  for t in LootTable:
+    for entry in t.entries:
+      entry.rollGroup != null implies DrawsAtMostOncePerGroup(entry, t)
+  for t in LootTable:
+    not exists e in t.entries where DrawsRng(e) and NotInArrayOrder(e, t)
+}
+
+-- Personal quest drops land only for players who have the matching quest
+-- active and have not yet met the collect objective's count. Fail closed:
+-- no matching active objective, no drop.
+invariant PersonalQuestDropEligibility {
+  for c in Corpse:
+    for slot in c.slots:
+      slot.personalFor != null implies ForAll(slot.personalFor, p => QuestActive(p, slot) and NotYetComplete(p, slot))
+}
+
+-- A soulbound (or instance.boundTo) item is barred from every transfer sink:
+-- player trade, mail attachment, World Market listing, and vendor sale. The
+-- noDiscard flag controls destruction independently so bound equipment can
+-- still be cleaned out.
+invariant SoulboundNonTransferable {
+  for i in Item:
+    i.soulbound = true implies not ListedOnMarket(i) and not InTradeOffer(i) and not InMailAttachment(i)
+  for inst in ItemInstance:
+    inst.boundTo != null implies not ListedOnMarket(inst) and not InTradeOffer(inst) and not InMailAttachment(inst)
+}
+
+-- No double-enchant: an already-enchanted instance is never consumed by
+-- ApplyEnchant or Disenchant. removeEnchantableItem only takes plain or
+-- not-yet-enchanted copies, so a second enchant on the same copy is impossible.
+invariant NoDoubleEnchant {
+  for inst in ItemInstance:
+    inst.enchant != null implies not EligibleEnchantTarget(inst)
+  for inst in ItemInstance:
+    inst.enchant != null implies not EligibleDisenchantSource(inst)
+}
+
+-- Set bonus tiers stack: at n equipped pieces of a set, every tier whose
+-- threshold is <= n is active. A 3-piece set grants both the 2- and 3-piece
+-- bonuses; tiers do not replace each other.
+invariant SetBonusesStack {
+  for set in ItemSet:
+    for p in PlayersWithSetEquipped(set):
+      let n = CountEquipped(p, set)
+      for tier in set.bonuses:
+        n >= tier.pieces implies BonusActive(p, set, tier)
+}
+
+-- A shipped item id is frozen for the lifetime of every save. Equipment,
+-- bags, bank, mail, and market listings store raw ids verbatim with no
+-- validation, so an id that stops resolving renders as an empty zero-stat
+-- slot. Removal means retiring every acquisition path, not deleting the def.
+invariant ShippedItemIdFrozen {
+  for i in Item:
+    not ShippedIdRemoved(i.id)
+}
+
+-- Catalogue consistency: an item's declared class/level gates, its set
+-- membership, its heroic parent, and its vendor prices are stable attributes
+-- of the def, fixed once at content authoring time. They never mutate per
+-- copy; a copy only varies via its ItemInstance payload.
+invariant CatalogueAttributesAreStable {
+  for i in Item:
+    i.requiredClass != null implies i.requiredClass.count >= 0
+  for i in Item:
+    i.requiredLevel >= 0
+  for i in Item:
+    i.setId != null implies ExistsSet(i.setId)
+  for i in Item:
+    i.heroicOf != null implies HeroicVariantOf(i, i.heroicOf)
+  for i in Item:
+    i.sellValue >= 0 and i.buyValue >= 0
+}
+
+-- Ownership is consistent: every inventory slot and every equipment slot
+-- belongs to exactly one player, and a player's slot collections are exactly
+-- the slots that name that player as owner.
+invariant SlotOwnership {
+  for s in InventorySlot:
+    s.owner.inventory.any(x = s)
+  for s in EquipmentSlot:
+    s.owner.equipment.any(x = s)
+}
+
+-- Every loot roll's candidate set is a subset of the tapping party's
+-- kill-time in-range members; the master looter (when set) is a party member.
+invariant LootRollCandidatesArePartyMembers {
+  for r in LootRoll:
+    r.candidates.forAll(c => c in r.party)
+}
+
+-- A corpse's owner-lock is anchored to the tapper and the spawn time: the
+-- FFA timer is measured from spawnedAt, and the lock party is the tapper's
+-- party snapshot at the moment of death (never the live party after a regroup).
+invariant CorpseOwnerLockAnchored {
+  for c in Corpse:
+    c.tappedBy != null implies c.tappedBy in c.party or c.party.count = 0
+  for c in Corpse:
+    c.spawnedAt <= c.ffaUnlockAt
+}

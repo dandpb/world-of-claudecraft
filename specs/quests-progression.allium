@@ -1,0 +1,532 @@
+-- allium: 3
+-- quests-progression.allium
+-- Scope: the quest lifecycle and objective credit, character leveling on a classic-era XP curve, and the once-per-period daily reward claim.
+-- Includes: Quest definition and objectives; the per-character quest log entry and its objective counters; quest availability resolution (prereq, min level, repeatable, retired); accept (solo and party-shared), kill/collect/gather/craft credit, ready transition, turn-in for rewards, abandon; XP award with rested bonus and the level cap; level up on the XP curve; cosmetic prestige and virtual level past the cap; daily reward eligibility, once-per-period claim, and the quest-completion points bridge.
+-- Excludes: party and raid formation and the kill/credit-sharing engine (social spec: this spec consumes QuestKillCredit and XpGranted as external stimuli); talent trees and spec choice (classes-talents spec: leveling unlocks talent points, the spend is out of scope); dungeon instance and lockout mechanics (dungeons spec); dungeon finder matchmaking (its own concern; finder reuses the level/quest eligibility resolved here); mail delivery of quest letters (social spec: a turn-in only queues the letter); inventory and bag capacity internals (items spec: the turn-in capacity gate is modelled as a guard, not the bag model); the wallet-link, SQL ledger, prize-pool payout, and spin RNG internals (daily rewards lives server-side outside the deterministic sim; only the eligibility, once-per-period claim, and points-bridge are modelled); wire snapshot fields and optimistic client state.
+
+------------------------------------------------------------
+-- Config (tunables the code encodes as named constants)
+------------------------------------------------------------
+
+config {
+  max_level: Integer = 20,
+  max_virtual_level: Integer = 200,
+  postcap_growth: Decimal = 1.1,
+  party_xp_range: Integer = 80,
+  interact_range: Integer = 5,
+  rested_cap_levels: Decimal = 1.5,
+  rested_fill_fraction: Decimal = 0.05,
+  rested_fill_hours: Integer = 8,
+  tick_seconds: Decimal = 0.05,
+  prestige_xp_per_rank: Integer = 23200,
+  daily_period_seconds: Integer = 86400,
+  daily_quest_base_points: Integer = 10,
+  daily_quest_min_multiplier: Integer = 1,
+  daily_quest_max_multiplier: Integer = 3,
+  daily_quest_minutes_per_multiplier: Integer = 30,
+  daily_min_wallet_usd: Decimal = 0
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ObjectiveType {
+  kill
+  | collect
+  | interact
+  | craft
+  | gather
+}
+
+-- The derived per-(character, quest) availability view computed by
+-- QuestStateFor below. Not stored on the log entry; the log entry only tracks
+-- the in-progress arm (active | ready).
+enum QuestState {
+  unavailable
+  | available
+  | active
+  | ready
+  | done
+}
+
+------------------------------------------------------------
+-- Static reference data
+------------------------------------------------------------
+
+-- One row per character level. The XP cost to go from level N to N+1 is the
+-- classic-era curve encoded as config (XpForLevel), not a dumped table here;
+-- past the cap the cost grows geometrically by postcap_growth for the cosmetic
+-- virtual level. is_cap marks the frozen level bar.
+entity Level {
+  number: Integer,
+  xp_to_next: Integer,
+  is_cap: number >= config.max_level,
+  is_virtual: number > config.max_level
+}
+
+-- A quest definition (authored content). giver and turn_in are the NPC proximity
+-- gates; requires_quest is the prerequisite quest that must be turned in first;
+-- min_level gates availability by character level; repeatable quests re-become
+-- available after turn-in; retired quests stay finishable if accepted but
+-- cannot be newly accepted; shareable opt-out gates party-link sharing.
+entity Quest {
+  id: String,
+  name: String,
+  giver: String,
+  turn_in: String,
+  min_level: Integer,
+  xp_reward: Integer,
+  copper_reward: Integer,
+  requires_quest: String,
+  repeatable: Boolean,
+  retired: Boolean,
+  shareable: Boolean,
+  objectives: List<QuestObjective>,
+  item_reward: String
+}
+
+-- One objective of a quest. type selects the credit path; required is the
+-- count needed; target identifies the mob template, item, recipe, or gather
+-- node the objective counts.
+entity QuestObjective {
+  quest: Quest,
+  type: ObjectiveType,
+  required: Integer,
+  target: String,
+  index: Integer
+}
+
+------------------------------------------------------------
+-- Character progression state
+------------------------------------------------------------
+
+-- The progression subject: identity plus the XP/level/rested state and the
+-- quest log + completed-quest history. level is bounded by max_level;
+-- xp_into_level is the bar toward the next level (frozen at cap);
+-- lifetime_xp is the monotonic post-cap counter that drives the virtual
+-- level, the leaderboard, and prestige; rested_xp is the inn-accrued kill
+-- bonus pool; quests_done records every turned-in quest id (repeatable
+-- quests stay here as history but re-become available).
+entity CharacterProgress {
+  id: Integer,
+  name: String,
+  level: Integer,
+  xp_into_level: Integer,
+  lifetime_xp: Integer,
+  rested_xp: Integer,
+  prestige_rank: Integer,
+  copper: Integer,
+  dead: Boolean,
+  quests_done: Set<String>,
+
+  at_cap: level >= config.max_level
+}
+
+-- A quest log entry: the per-character, per-quest state. status tracks only
+-- the in-progress arm (active | ready). Turn-in and abandon remove the entry
+-- and record completion in CharacterProgress.quests_done.
+entity QuestProgress {
+  character: CharacterProgress,
+  quest: Quest,
+  status: active | ready,
+  transitions status { active -> ready, ready -> active }
+}
+
+-- The per-character, per-objective counter. count is bounded by the parent
+-- objective's required value. Kill/gather/craft objectives only increment;
+-- collect objectives reflect current inventory and can also revert. status
+-- flips to complete when count meets required and back to incomplete when a
+-- collect count drops below required.
+entity ObjectiveProgress {
+  quest_progress: QuestProgress,
+  objective: QuestObjective,
+  count: Integer,
+  status: incomplete | complete,
+  transitions status { incomplete -> complete, complete -> incomplete },
+
+  is_complete: count >= objective.required
+}
+
+------------------------------------------------------------
+-- Daily reward (server-side, once per UTC reward day)
+------------------------------------------------------------
+
+-- A claimed daily reward spin. Existence of a row for (account, period) IS
+-- the claim; the once-per-period rule is the invariant below. period is the
+-- reward day (a UTC day string). Eligibility (a linked wallet whose held
+-- balance meets the USD minimum and the account is not daily-reward banned)
+-- is a derived predicate, not stored state.
+entity DailyReward {
+  account: Integer,
+  period: String,
+  outcome: String,
+  points: Integer,
+  claimed_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Quest state resolution (derived availability view)
+------------------------------------------------------------
+
+-- QuestStateFor is the pure availability function shared by the sim and the
+-- online client. It reads the log entry state directly and otherwise derives
+-- unavailable/available/done from prereq, min level, retired, repeatable, and
+-- profession-choice validity. Modelled as an invariant that pins the mapping.
+invariant QuestStateIsDerived {
+  for c in CharacterProgress:
+    for q in Quest:
+      let qp = LogEntry(c, q)
+      let qp_state = if qp != null: (if qp.status = ready: QuestState.ready else: QuestState.active) else: QuestState.unavailable
+      QuestStateFor(c, q) = if qp != null: qp_state
+        else: if q.retired: QuestState.unavailable
+        else: if (q.id in c.quests_done) and not q.repeatable: QuestState.done
+        else: if q.requires_quest != null and not (q.requires_quest in c.quests_done): QuestState.unavailable
+        else: if q.min_level > c.level: QuestState.unavailable
+        else: QuestState.available
+}
+
+------------------------------------------------------------
+-- Quest accept
+------------------------------------------------------------
+
+-- Solo accept from the quest giver. Availability, giver proximity, profession
+-- choice validity, and liveness (not dead) gate the accept. The shared
+-- finalize core records the log entry as active with a zeroed counter per
+-- objective, then re-grants any prerequisite item the character no longer
+-- holds so a lost key can never permanently block progression.
+rule AcceptQuest {
+  when: AcceptQuest(character, quest, selection)
+  requires: not character.dead
+  requires: QuestStateFor(character, quest) = QuestState.available
+  requires: ProfessionChoiceValid(quest, character, selection)
+  requires: NearbyGiver(character, quest)
+  ensures: QuestProgress.created(character = character, quest = quest, status: active)
+  for obj in QuestObjectives(quest):
+    ensures: ObjectiveProgress.created(quest_progress = LogEntry(character, quest), objective = obj, count = 0, status: incomplete)
+  for itemId in RequiredItemsNotHeld(quest, character):
+    ensures: ItemGranted(character, itemId, 1)
+  ensures: QuestAccepted(character, quest)
+}
+
+-- Party-shared accept (quest link). Same finalize core, but the trigger is a
+-- share from a party member: both must be in the same party, the quest must
+-- be shareable and not retired, and availability still applies. Party
+-- membership itself is the social spec's concern; this rule only gates the
+-- shared accept.
+rule AcceptSharedQuest {
+  when: AcceptSharedQuest(character, quest, sharer)
+  requires: not character.dead
+  requires: quest.shareable
+  requires: not quest.retired
+  requires: SameParty(character, sharer)
+  requires: QuestStateFor(character, quest) = QuestState.available
+  ensures: QuestProgress.created(character = character, quest = quest, status: active)
+  for obj in QuestObjectives(quest):
+    ensures: ObjectiveProgress.created(quest_progress = LogEntry(character, quest), objective = obj, count = 0, status: incomplete)
+  ensures: QuestAccepted(character, quest)
+  ensures: ShareAcknowledged(sharer, character, quest)
+}
+
+------------------------------------------------------------
+-- Objective credit (advance the counter)
+------------------------------------------------------------
+
+-- Kill credit arrives as an external stimulus from the social spec's party
+-- credit-sharing rule (solo, the killer is the credited character). Each
+-- active log entry with a matching incomplete kill objective advances by one.
+rule AdvanceObjectiveOnKill {
+  when: QuestKillCredit(character, mobTemplate)
+  for op in MatchingObjectives(character, ObjectiveType.kill, mobTemplate) where op.quest_progress.status in {active, ready} and op.count < op.objective.required:
+    let next = op.count + 1
+    ensures: op.count = next
+    ensures: ObjectiveAdvanced(op.quest_progress.character, op.quest_progress.quest, op.objective, next, op.objective.required)
+}
+
+-- Gather credit: a harvest that matches the gather objective's node type
+-- and optional item. The authoritative gather grant has already succeeded.
+rule AdvanceObjectiveOnGather {
+  when: GatherNodeHarvested(character, nodeType, itemId)
+  for op in GatherObjectives(character, nodeType, itemId) where op.quest_progress.status in {active, ready} and op.count < op.objective.required:
+    let next = op.count + 1
+    ensures: op.count = next
+    ensures: ObjectiveAdvanced(op.quest_progress.character, op.quest_progress.quest, op.objective, next, op.objective.required)
+}
+
+-- Craft credit: only after the authoritative craft resolver succeeds.
+rule AdvanceObjectiveOnCraft {
+  when: RecipeCrafted(character, recipeId)
+  for op in CraftObjectives(character, recipeId) where op.quest_progress.status in {active, ready} and op.count < op.objective.required:
+    let next = op.count + 1
+    ensures: op.count = next
+    ensures: ObjectiveAdvanced(op.quest_progress.character, op.quest_progress.quest, op.objective, next, op.objective.required)
+}
+
+-- Collect credit reflects current inventory, not a discrete event. On any
+-- inventory change it snaps each collect objective's count to the held
+-- amount (clamped to required), which both advances and reverts.
+rule SyncCollectObjective {
+  when: InventoryChanged(character)
+  for op in CollectObjectives(character) where op.quest_progress.status in {active, ready}:
+    let held = Min(HeldCount(character, op.objective.target), op.objective.required)
+    if held != op.count:
+      ensures: op.count = held
+      ensures: ObjectiveAdvanced(op.quest_progress.character, op.quest_progress.quest, op.objective, held, op.objective.required)
+}
+
+------------------------------------------------------------
+-- Objective completion / revert (status transitions)
+------------------------------------------------------------
+
+-- An objective completes when its counter meets the required count. Derived
+-- trigger: re-evaluated after every credit rule increments the counter.
+rule CompleteObjective {
+  when: op: ObjectiveProgress.count >= op.objective.required
+  requires: op.status = incomplete
+  ensures: op.status = complete
+}
+
+-- A collect objective reverts when the held count drops below required
+-- (item used, sold, or mailed). Kill/gather/craft counters never decrease.
+rule RevertObjective {
+  when: op: ObjectiveProgress.count < op.objective.required
+  requires: op.status = complete
+  ensures: op.status = incomplete
+}
+
+------------------------------------------------------------
+-- Quest ready / revert
+------------------------------------------------------------
+
+-- When the last objective completes, the quest becomes ready (turn-in
+-- available). Fires off the objective status transition.
+rule MarkQuestReady {
+  when: op: ObjectiveProgress.status transitions_to complete
+  let qp = op.quest_progress
+  requires: qp.status = active
+  requires: AllObjectivesComplete(qp)
+  ensures: qp.status = ready
+  ensures: QuestReady(qp.character, qp.quest)
+}
+
+-- Collect hand-ins are reversible: dropping below required reverts the
+-- objective, which must revert a ready quest to active so it cannot be
+-- turned in without the goods.
+rule RevertReadyToActive {
+  when: op: ObjectiveProgress.status transitions_to incomplete
+  let qp = op.quest_progress
+  requires: qp.status = ready
+  ensures: qp.status = active
+}
+
+------------------------------------------------------------
+-- Quest turn-in and abandon
+------------------------------------------------------------
+
+-- Turn in a ready quest at its turn-in NPC. Dead characters cannot turn in.
+-- A capacity gate ensures the reward item fits AFTER the collect items are
+-- handed in (classic rule). The shared turn-in core consumes collect items,
+-- records completion, grants copper/item/xp, and queues the giver's letter.
+rule TurnInQuest {
+  when: TurnInQuest(character, quest)
+  requires: not character.dead
+  let qp = LogEntry(character, quest)
+  requires: qp != null
+  requires: qp.status = ready
+  requires: ProfessionChoiceValid(quest, character, qp.selection)
+  requires: NearbyTurnIn(character, quest)
+  requires: RewardFitsAfterHandIn(character, quest, qp)
+  for obj in CollectObjectivesOf(quest):
+    ensures: ItemRemoved(character, obj.target, obj.required)
+  ensures: not exists qp
+  ensures: character.quests_done = character.quests_done + SetOf(quest.id)
+  if quest.copper_reward > 0:
+    ensures: character.copper = character.copper + quest.copper_reward
+  if quest.item_reward != null:
+    ensures: ItemGranted(character, quest.item_reward, 1)
+  ensures: XpGranted(character, quest.xp_reward, false)
+  ensures: QuestCompleted(character, quest)
+  ensures: QuestLetterQueued(quest, character)
+}
+
+-- Abandon removes the log entry without completion credit. Repeatable or not,
+-- abandoning never writes quests_done.
+rule AbandonQuest {
+  when: AbandonQuest(character, quest)
+  let qp = LogEntry(character, quest)
+  requires: qp != null
+  ensures: not exists qp
+  ensures: QuestAbandoned(character, quest)
+}
+
+------------------------------------------------------------
+-- XP award and leveling
+------------------------------------------------------------
+
+-- XP arrives as an external stimulus (kills via the social spec party-share,
+-- quests via TurnInQuest, and discovery). Lifetime XP accrues for EVERY award
+-- including at the cap (it feeds the virtual level, leaderboard, and
+-- prestige). The level bar only advances below the cap. Rested XP doubles KILL
+-- xp only, never quest xp, and never past the cap; the bonus drawn down is
+-- added to the award.
+rule AwardXp {
+  when: XpGranted(character, amount, fromKill)
+  requires: amount > 0
+  let rested_bonus = if fromKill and character.level < config.max_level and character.rested_xp > 0: Min(Floor(character.rested_xp), amount) else: 0
+  let total = amount + rested_bonus
+  ensures: character.lifetime_xp = CapLifetime(character.lifetime_xp + total)
+  if character.level < config.max_level:
+    ensures: character.xp_into_level = character.xp_into_level + total
+    if rested_bonus > 0:
+      ensures: character.rested_xp = character.rested_xp - rested_bonus
+  ensures: XpAwarded(character, total, rested_bonus)
+}
+
+-- Cross the level threshold: subtract the level's XP cost, raise the level,
+-- and unlock things (talent point, abilities). Re-fires until the bar is
+-- below the next threshold or the cap is reached, so a large award can
+-- multi-ding in one step. Reaching the cap clears the leftover bar.
+rule LevelUp {
+  when: cp: CharacterProgress.xp_into_level >= XpForLevel(cp.level)
+  requires: cp.level < config.max_level
+  let required = XpForLevel(cp.level)
+  let new_level = cp.level + 1
+  ensures: cp.xp_into_level = cp.xp_into_level - required
+  ensures: cp.level = new_level
+  if new_level >= config.max_level:
+    ensures: cp.xp_into_level = 0
+  ensures: LevelUpEvent(cp, new_level)
+  ensures: AbilitiesRefreshed(cp)
+}
+
+-- Accrue rested XP while resting at an inn and out of combat, paced off the
+-- sim tick (never wall-clock), clamped to the classic-era cap of 1.5 levels
+-- and never at the cap (no level bar to advance).
+rule AccrueRestedXp {
+  when: StepTick(host, sim)
+  for cp in RestingCharacters() where cp.level < config.max_level:
+    let cap = config.rested_cap_levels * XpForLevel(cp.level)
+    if cp.rested_xp < cap:
+      let per_second = (config.rested_fill_fraction * XpForLevel(cp.level)) / (config.rested_fill_hours * 3600)
+      ensures: cp.rested_xp = Min(cap, cp.rested_xp + per_second * config.tick_seconds)
+}
+
+-- Cosmetic prestige at the cap. Resets the (frozen) level bar and bumps the
+-- prestige rank, leaving level, lifetimeXp, gear, and talents untouched:
+-- strictly cosmetic, zero power. Authoritative anti-abuse: the rank is bounded
+-- by what lifetimeXp supports, so a hacked prestige command cannot inflate it.
+rule Prestige {
+  when: Prestige(character)
+  requires: character.level >= config.max_level
+  requires: character.prestige_rank < MaxPrestigeRank(character.lifetime_xp)
+  let new_rank = character.prestige_rank + 1
+  ensures: character.xp_into_level = 0
+  ensures: character.prestige_rank = new_rank
+  ensures: PrestigeRankUp(character, new_rank)
+}
+
+------------------------------------------------------------
+-- Daily reward
+------------------------------------------------------------
+
+-- Claim the daily spin once per reward period. Eligibility (linked wallet
+-- meeting the USD minimum, account not daily-reward banned) and the
+-- once-per-period guard are both required. The weighted outcome table is
+-- server-side config; the points land on the period's leaderboard.
+rule ClaimDailyReward {
+  when: ClaimDailyReward(account)
+  let period = CurrentRewardDay(now)
+  requires: not exists d in DailyReward where d.account = account and d.period = period
+  requires: DailyEligible(account)
+  let outcome = PickSpinOutcome()
+  let points = PointsForOutcome(outcome)
+  ensures: DailyReward.created(account = account, period = period, outcome = outcome, points = points, claimed_at = now)
+  ensures: DailyRewardClaimed(account, period, points, outcome)
+}
+
+-- The quest-completion bridge: each turn-in accrues daily task points to the
+-- account's period total, scaled by an online-time multiplier and tapered for
+-- repeats of the same quest. Only accrues while eligible; a banned or
+-- walletless character still completes the quest (QuestCompleted fires from
+-- TurnInQuest) but earns no daily points.
+rule AccrueDailyQuestPoints {
+  when: QuestCompleted(character, quest)
+  let account = AccountOf(character)
+  let period = CurrentRewardDay(now)
+  requires: DailyEligible(account)
+  let online_minutes = OnlineMinutes(account, period)
+  let multiplier = QuestOnlineMultiplier(online_minutes)
+  let base = config.daily_quest_base_points * multiplier
+  let awarded = RepeatQuestPoints(base, PriorQuestCompletions(account, period, quest))
+  if awarded > 0:
+    ensures: DailyTaskPointsAccrued(account, period, awarded, quest)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The level curve is config-driven, not a dumped table: each Level row's
+-- XP cost comes straight from the XpForLevel curve, is_cap marks the frozen
+-- bar, and virtual rows (past the cap) grow geometrically by postcap_growth.
+invariant LevelCurveIsConfig {
+  for lvl in Level:
+    lvl.xp_to_next = XpForLevel(lvl.number) and lvl.is_cap = (lvl.number >= config.max_level) and (lvl.is_virtual implies lvl.xp_to_next = Round(XpForLevel(config.max_level) * GrowthFactor(lvl.number)))
+}
+
+-- The objective counter never exceeds the required count, and a complete
+-- objective's count has met required.
+invariant ObjectiveProgressBounded {
+  for op in ObjectiveProgress:
+    op.count >= 0 and op.count <= op.objective.required and (op.status = complete implies op.count >= op.objective.required)
+}
+
+-- A quest is ready only when every objective is complete; an active quest has
+-- at least one objective incomplete.
+invariant ReadyRequiresAllObjectives {
+  for qp in QuestProgress:
+    (qp.status = ready implies AllObjectivesComplete(qp)) and (qp.status = active implies not AllObjectivesComplete(qp))
+}
+
+-- A repeatable quest that is not in the log and whose prereqs are met is
+-- available again after turn-in; a non-repeatable turned-in quest is done.
+invariant RepeatableQuestReavailable {
+  for c in CharacterProgress:
+    for q in Quest:
+      q.repeatable and LogEntry(c, q) = null and PrereqsMet(c, q) and c.level >= q.min_level implies QuestStateFor(c, q) = QuestState.available
+}
+
+-- Level never exceeds the cap; at the cap the level bar is frozen at zero.
+invariant LevelCappedAtMax {
+  for c in CharacterProgress:
+    c.level <= config.max_level and (c.level >= config.max_level implies c.xp_into_level = 0)
+}
+
+-- Lifetime XP is monotonic and 2^53-safe (the sim clamps at the JS safe
+-- integer ceiling). prestige_rank is bounded by what lifetimeXp supports, so
+-- no command can inflate rank beyond XP actually earned.
+invariant LifetimeXpMonotonic {
+  for c in CharacterProgress:
+    c.lifetime_xp >= 0 and c.prestige_rank <= MaxPrestigeRank(c.lifetime_xp)
+}
+
+-- Rested XP never exceeds the classic-era 1.5-level cap for the current level.
+invariant RestedXpBounded {
+  for c in CharacterProgress:
+    c.rested_xp >= 0 and c.rested_xp <= config.rested_cap_levels * XpForLevel(c.level)
+}
+
+-- At most one claimed daily reward per account per reward period.
+invariant DailyRewardOncePerPeriod {
+  for d1 in DailyReward:
+    for d2 in DailyReward:
+      d1.account = d2.account and d1.period = d2.period implies d1 = d2
+}
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+open question "Quest credit for interact objectives is gated by an isQuestInteractionEntity predicate over NPC/object proximity; should the spec model the interact-credit path explicitly, or keep it abstract behind QuestKillCredit-style stimuli?"
+open question "The profession attunement quest (completionEffect attunePair/switchHobby, selection persisted on the log entry) overlaps the professions spec's archetype state machine; model the selection guard there and reference it here, or keep ProfessionChoiceValid abstract?"
+open question "The daily reward spin outcome uses a weighted table drawn server-side (outside the deterministic sim Rng contract); should the outcome weights be promoted to first-class config here, or stay an external service detail?"
+open question "Optimistic quest-state resolution on the client treats an in-flight turn-in as done for OTHER quests' prereq checks until the server snapshot lands; this is display-only and reconciled on snapshot. Model it as a client-mirror rule, or leave it to the server-authority spec?"

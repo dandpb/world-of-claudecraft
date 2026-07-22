@@ -1,0 +1,780 @@
+-- allium: 3
+-- hud.allium
+-- Scope: the classic MMO HUD as a presentation-only layer over IWorld: the player-facing windows (action bar, self/target/party unit frames, cast bar, quest tracker, chat, loot), the per-frame write-elision contract, the static-preset tier model, and the graphics-fairness invariant.
+-- Includes: each window as a surface with its visible state and player operations; the window open/close lifecycle with focus restore; the write-elision contract (a repeat value to the same element+slot is a no-op DOM write); the tier resolver and its two-controller separation from the FPS governor; the gameplay-neutral invariant (a tier sheds cosmetic richness only, never actionable info: own debuffs, party HP, the target cast bar, target HP granularity, enemy positions).
+-- Excludes: the i18n of HUD strings (the t() contract; the i18n spec); the sim data the HUD reads (HP, auras, loot, quests each owned by their spec); the renderer 3D scene; CSS/DOM mechanics, tokens, layout, the no-magic-values rule, allocation-light cores, and canvas hot-path techniques; the keybind/input layer (the game spec); WCAG chrome detail beyond the focus trap; the painter implementations.
+
+------------------------------------------------------------
+-- Config (the tier constants and cadences the fairness rule names)
+------------------------------------------------------------
+
+config {
+  tick_rate_hz: Integer = 20,
+  reaction_loop_ms: Integer = 200,
+  fct_pool_cap: Integer = 64,
+  fct_max_concurrent_low: Integer = 24,
+  aura_visible_cap_low: Integer = 8,
+  aura_refresh_interval_low_ms: Integer = 250,
+  minimap_redraw_interval_low_ms: Integer = 250,
+  target_body_refresh_interval_low_ms: Integer = 100,
+  party_frame_range_yd: Integer = 40
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The discrete HUD effect tier. Drives every cost knob below. Only `low`
+-- sheds; medium / high / ultra are byte-equivalent to pre-tiering.
+enum UiEffectsTier {
+    low
+    | medium
+    | high
+    | ultra
+}
+
+-- The motion axis, independent of tier. Reduced-motion is the strongest
+-- motion authority and maps to `none`.
+enum UiEffectsMotion {
+    full
+    | reduced
+    | none
+}
+
+-- The player-chosen STATIC graphics preset label. `advanced` is the custom
+-- path whose effectsQuality slider can clamp to low.
+enum PresetLabel {
+    low
+    | medium
+    | high
+    | ultra
+    | advanced
+}
+
+-- The slot kinds a single action-bar cell can resolve to.
+enum ActionBarSlotKind {
+    attack
+    | ability
+    | item
+    | empty
+}
+
+-- A cast bar state. Filling is a cast; draining is a channel or the
+-- eat/drink overlay.
+enum CastPhase {
+    idle
+    | casting
+    | channeling
+    | consuming
+}
+
+-- An aura's gameplay classification, as the strip renders it. The fairness
+-- rule turns on the debuff arm never being culled.
+enum AuraClass {
+    buff
+    | debuff
+    | toggle
+}
+
+enum WindowKind {
+    action_bar
+    | self_frame
+    | target_frame
+    | party_frame
+    | cast_bar
+    | quest_tracker
+    | chat
+    | loot
+    | transient
+    | none
+}
+
+------------------------------------------------------------
+-- External entities (owned by other specs)
+------------------------------------------------------------
+
+-- The viewer. The HUD reads the player's world via IWorld and routes the
+-- player's commands back through it; it never holds gameplay authority.
+entity Player {
+    level: Integer,
+    power_state: String,
+    target: Entity?,
+    party: Party?,
+    action_bar: List<ActionBarSlot>,
+    graphics_preset: PresetLabel,
+    effects_quality: Integer,
+    reduce_motion: Boolean
+}
+
+-- A sim entity the HUD frames render: self, target, a party member, a mob,
+-- a corpse, a chest. The HUD never mutates any of these.
+entity Entity {
+    id: Integer,
+    kind: String,
+    name: String,
+    hp: Integer,
+    max_hp: Integer,
+    auras: Set<Aura>,
+    cast: CastState?
+}
+
+entity Party {
+    members: List<Entity>
+}
+
+-- The cast/channel state read by a unit frame and the cast bar. Owned by the
+-- sim; the HUD renders it.
+entity CastState {
+    phase: CastPhase,
+    label_key: String,
+    remaining: Duration,
+    total: Duration,
+    progress_frac: Integer
+}
+
+entity Aura {
+    id: String,
+    class: AuraClass,
+    stacks: Integer,
+    remaining: Duration
+}
+
+entity Corpse {
+    entity: Entity,
+    has_loot: Boolean,
+    copper: Integer,
+    items: List<LootEntry>
+}
+
+entity Chest {
+    entity: Entity,
+    items: List<LootEntry>
+}
+
+entity LootEntry {
+    item_id: String,
+    count: Integer
+}
+
+entity Quest {
+    id: String,
+    title: String,
+    complete: Boolean,
+    objectives: List<QuestObjective>
+}
+
+entity QuestObjective {
+    label: String,
+    current: Integer,
+    total: Integer
+}
+
+entity ChatChannel {
+    id: String,
+    name: String
+}
+
+entity ChatLine {
+    channel: ChatChannel,
+    sender: String,
+    text: String,
+    sent_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Value types
+------------------------------------------------------------
+
+-- One cell of the action bar. The player sees its kind, its bound ability
+-- or item, its keybind label, its cooldown, its cost and charges, and its
+-- usable / in-range / gcd-ready state.
+value ActionBarSlot {
+    slot: Integer,
+    kind: ActionBarSlotKind,
+    ability_id: String,
+    item_id: String,
+    keybind_label: String,
+    cooldown_remaining: Duration,
+    charges: Integer,
+    resource_cost: Integer,
+    usable: Boolean,
+    range_ok: Boolean,
+    gcd_ready: Boolean
+}
+
+-- The resolved inputs the tier resolver reads. preset + effectsQuality +
+-- reduce_motion. All three are STATIC (player-chosen), never the governor.
+value GraphicsInput {
+    preset: PresetLabel,
+    effects_quality: Integer,
+    reduce_motion: Boolean
+}
+
+------------------------------------------------------------
+-- Owned entities
+------------------------------------------------------------
+
+-- The shared seam every window composes into. Holds the open-window set,
+-- the focus owner, and the PainterHost (the write cache). Windows never
+-- import a concrete coordinator; they receive this bag.
+entity HudContext {
+    player: Player,
+    open_windows: Set<HudWindow> with context = this,
+    focus_owner: HudWindow?,
+    host: PainterHost with context = this,
+    profile: GraphicsProfile with context = this
+}
+
+-- An open window. The transient slot (a loot popup) holds at most one: a
+-- new transient closes any other transient on open. Focus traps inside an
+-- open window and restores to the opener on close. A loot window also
+-- carries the corpse or chest it was opened against.
+entity HudWindow {
+    context: HudContext,
+    kind: WindowKind,
+    opener: HudWindow?,
+    corpse: Corpse?,
+    chest: Chest?,
+    status: closed | open,
+    last_focused_at: Timestamp,
+
+    transitions status {
+        closed -> open,
+        open -> closed,
+        terminal: closed
+    }
+}
+
+-- The resolved HUD effect profile. Source of every tier knob. Stamped from
+-- the STATIC preset, never the governor.
+entity GraphicsProfile {
+    context: HudContext,
+    tier: UiEffectsTier,
+    motion: UiEffectsMotion,
+    heavy_shadows: Boolean,
+    ambient_anim_running: Boolean,
+    fct_crit_emphasis: Boolean
+}
+
+-- The write-elision host. One cache per (element, slot). The contract below
+-- is the only path a painter writes through.
+entity PainterHost {
+    context: HudContext,
+    cache: Set<WriteSlot> with host = this
+}
+
+-- A single cached write slot. Single-slot writers (text/display/transform/
+-- width) own one slot per element; multi-slot writers (custom property,
+-- class, attribute) key on (element, name) so one element can hold many.
+entity WriteSlot {
+    host: PainterHost,
+    element: String,
+    name: String,
+    value: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The write-elision contract. Every per-frame DOM write a painter makes goes
+-- through one of these operations. A repeat of the same value to the same
+-- (element, slot) is a no-op, so a no-change frame costs no DOM mutation.
+contract WriteElision {
+    setText: (host: PainterHost, element: String, text: String) -> Boolean
+    setDisplay: (host: PainterHost, element: String, display: String) -> Boolean
+    setTransform: (host: PainterHost, element: String, transform: String) -> Boolean
+    setWidth: (host: PainterHost, element: String, width: String) -> Boolean
+    setStyleProp: (host: PainterHost, element: String, prop: String, value: String) -> Boolean
+    toggleClass: (host: PainterHost, element: String, cls: String, on: Boolean) -> Boolean
+    setAttr: (host: PainterHost, element: String, name: String, value: String) -> Boolean
+
+    @invariant RepeatValueIsNoOp
+        -- A writer invoked twice with the same (element, slot, value)
+        -- mutates the DOM at most once. The second and every subsequent
+        -- identical call skips, so a frame that resolves no changes performs
+        -- zero DOM writes.
+
+    @invariant SingleAndMultiSlotPartitioned
+        -- The four single-slot writers each own one facet per element; the
+        -- three multi-slot writers are keyed per (element, name). The two
+        -- caches never collide, so eliding one cannot silently drop a
+        -- sibling write on the same element.
+
+    @invariant PaintersRouteEveryWriteThroughTheWriters
+        -- A per-frame painter never reaches the DOM directly. Routing every
+        -- write through the writers is what keeps the skip-rate one number
+        -- and what makes the no-op-on-repeat guarantee load-bearing.
+}
+
+-- The tier resolver. A pure function of the STATIC preset + effectsQuality +
+-- reduce_motion. Never reads the FPS governor (the two-controller hazard:
+-- the governor cannot measure compositor cost, so the HUD tier is owned by
+-- the preset the player chose).
+contract TierResolver {
+    resolve: (input: GraphicsInput) -> GraphicsProfile
+    equal: (a: GraphicsProfile, b: GraphicsProfile) -> Boolean
+
+    @invariant ReadsStaticPresetNeverGovernor
+        -- The resolved tier is a function of the player-chosen preset and
+        -- the reduce-motion flag alone. The live FPS governor never moves
+        -- it, so two players on the same preset always see the same tier.
+
+    @invariant TierIsAFloorNotACeiling
+        -- The preset sets the baseline effect level. Nothing in the resolver
+        -- raises a tier above the player's choice; a heavier machine on the
+        -- same preset stays at that preset.
+
+    @invariant OnlyLowSheds
+        -- medium, high, and ultra are byte-equivalent to pre-tiering. The
+        -- cost-shedding branch fires on tier = low alone.
+
+    @invariant AdvancedClampsToLowBelowCutoff
+        -- The advanced preset whose effectsQuality falls below the low
+        -- cutoff resolves to low; otherwise advanced behaves as ultra. It
+        -- is never collapsed to high.
+
+    @invariant ReduceMotionIsStrongestMotionAuthority
+        -- reduce_motion forces motion = none and pauses ambient loops, but
+        -- does NOT by itself drop decorative glass or shadows (that is the
+        -- tier's job, so a reduced-motion ultra player keeps glass).
+}
+
+------------------------------------------------------------
+-- Rules: the per-frame paint pass
+------------------------------------------------------------
+
+-- The per-frame paint pass. For every window the context holds open,
+-- resolve the DOM-free view from IWorld, then route each changed value
+-- through the write-elision contract. No painter writes outside the
+-- contract; no frame mutates game state.
+rule PaintHudFrame {
+    when: HudTick(ctx, now)
+    for window in ctx.open_windows:
+        let view = ResolveView(window, ctx.player)
+        for change in ChangedSlots(view):
+            ensures: RoutedThroughWriter(ctx.host, change)
+}
+
+------------------------------------------------------------
+-- Rules: window lifecycle
+------------------------------------------------------------
+
+-- Opening a window sets it open, makes it the focus owner, traps focus
+-- inside it, and records the opener for restore-on-close. A transient
+-- window (a loot popup) closes any other transient in the same open call.
+rule OpenHudWindow {
+    when: PlayerOpensWindow(player, window)
+    requires: window.context.player = player
+    ensures:
+        if window.kind = transient:
+            for other in window.context.open_windows:
+                if other.kind = transient and other.status = open:
+                    other.status = closed
+        window.status = open
+        window.context.open_windows = window.context.open_windows + window
+        window.context.focus_owner = window
+        window.opener = PriorFocusOwner(window.context)
+        FocusTrappedInside(window)
+}
+
+-- Closing a window sets it closed, drops it from the open set, and restores
+-- focus to its opener (or clears focus ownership if it had no opener).
+rule CloseHudWindow {
+    when: PlayerClosesWindow(player, window)
+    requires: window.status = open
+    ensures:
+        window.status = closed
+        window.context.open_windows = window.context.open_windows - window
+        if window.opener != null:
+            window.context.focus_owner = window.opener
+        else:
+            window.context.focus_owner = null
+        FocusReturnedTo(window.opener)
+}
+
+-- A loot window opens on a corpse the player can loot. It is range-gated:
+-- walking out of range, or the corpse going empty, closes it.
+rule OpenLootFromCorpse {
+    when: PlayerLootsCorpse(player, corpse)
+    requires: corpse.has_loot or corpse.copper > 0
+    requires: WithinLootRange(player, corpse)
+    ensures:
+        let w = HudWindow.created(
+            context: player.context,
+            kind: WindowKind.loot,
+            opener: PriorFocusOwner(player.context),
+            corpse: corpse,
+            chest: null,
+            status: open,
+            last_focused_at: now
+        )
+        w.status = open
+        w.context.open_windows = w.context.open_windows + w
+}
+
+rule CloseLootOnRangeOrEmpty {
+    when: HudTick(ctx, now)
+    ensures:
+        for w in ctx.open_windows:
+            if w.kind = loot and w.corpse != null:
+                if not WithinLootRange(ctx.player, w.corpse) or not w.corpse.has_loot:
+                    w.status = closed
+}
+
+------------------------------------------------------------
+-- Rules: player operations through IWorld
+------------------------------------------------------------
+
+-- Using an action-bar slot fires the matching IWorld command. The HUD does
+-- not decide the outcome; the sim (offline) or the server (online) does.
+-- A slot on cooldown, out of range, or without its resource is dimmed and
+-- the command is not sent.
+rule UseActionBarSlot {
+    when: PlayerUsesSlot(player, slot)
+    requires: slot.usable
+    requires: slot.range_ok
+    requires: slot.gcd_ready
+    ensures: SlotCommandSent(player, slot)
+}
+
+-- Sending a chat line dispatches the text to the chosen channel through
+-- IWorld. The server is authoritative for routing and the moderation filter.
+rule SendChatLine {
+    when: PlayerSendsChat(player, channel, text)
+    requires: text != ""
+    ensures: ChatLine.created(channel = channel, sender = player.name, text = text, sent_at = now)
+    ensures: ChatLineSent(player, channel, text)
+}
+
+-- Taking all loot from a corpse or chest fires the matching IWorld command
+-- and closes the popup. The loot rights and the roll resolution live in the
+-- sim, not here.
+rule TakeAllLoot {
+    when: PlayerTakesAll(player, window)
+    requires: window.status = open
+    if window.corpse != null:
+        ensures: LootCorpseCommandSent(player, window.corpse)
+    if window.chest != null:
+        ensures: CollectChestLootCommandSent(player, window.chest)
+    ensures: window.status = closed
+}
+
+------------------------------------------------------------
+-- Rules: the tier model
+------------------------------------------------------------
+
+-- Resolving the profile reads only the STATIC inputs. The governor is not
+-- an input. Advanced below the cutoff clamps to low; otherwise advanced is
+-- ultra. Only low sheds.
+rule ResolveProfile {
+    when: GraphicsInputChanged(ctx, input)
+    let tier = ResolveTier(input.preset, input.effects_quality)
+    let motion = ResolveMotion(input.reduce_motion)
+    let low_cost = tier = UiEffectsTier.low
+    ensures: ctx.profile.tier = tier
+    ensures: ctx.profile.motion = motion
+    ensures: ctx.profile.heavy_shadows = not low_cost
+    ensures: ctx.profile.ambient_anim_running = not (low_cost or input.reduce_motion)
+    ensures: ctx.profile.fct_crit_emphasis = tier != UiEffectsTier.low
+}
+
+-- Applying the profile is diff-guarded: a same-profile re-apply is a no-op,
+-- so a no-op settings change never forces the one-time large style recalc a
+-- real tier switch incurs.
+rule ApplyProfileIfChanged {
+    when: GraphicsInputChanged(ctx, input)
+    let next = TierResolver.resolve(input)
+    requires: not TierResolver.equal(ctx.profile, next)
+    ensures: ProfileStamped(ctx, next)
+}
+
+-- The aura cap on low is debuff-priority. A debuff is never culled by the
+-- cap on any tier; only buff overflow past the cap sheds, and only on low.
+rule CullAuraOverflowDebuffPriority {
+    when: HudTick(ctx, now)
+    let cap = AuraCapFor(ctx.profile.tier)
+    for aura in ActiveAuras(ctx.player):
+        if aura.class = AuraClass.debuff:
+            ensures: AuraRendered(aura)
+}
+
+------------------------------------------------------------
+-- Invariants: the design contract
+------------------------------------------------------------
+
+-- PRESENTATION ONLY. The HUD reads the world via IWorld and routes player
+-- commands back through it. It never resolves a combat, loot, quest, or
+-- economy outcome, and it never mutates authoritative state. The offline
+-- Sim and the online ClientWorld satisfy the same IWorld shape, so the HUD
+-- is identical in both hosts.
+invariant PresentationNeverMutatesSim {
+    for ctx in HudContext:
+        for window in ctx.open_windows:
+            NotDecidingOutcomes(window)
+}
+
+-- The two-controller separation. The HUD effect tier is a function of the
+-- STATIC preset the player chose; the live FPS governor never moves it. A
+-- player on a heavier machine running the same preset sees the same tier.
+invariant TierReadsStaticPresetNeverGovernor {
+    for ctx in HudContext:
+        for input in GraphicsInput:
+            TierResolver.resolve(input).tier = ResolveTier(input.preset, input.effects_quality)
+    for ctx in HudContext:
+        GovernorNeverRead(ctx.profile)
+}
+
+-- Only low sheds. medium, high, and ultra are byte-equivalent in HUD cost to
+-- pre-tiering, so the default ultra tier is untouched and a tier switch is a
+-- no-op until the player drops to low.
+invariant OnlyLowTierSheds {
+    for p in GraphicsProfile:
+        p.tier != UiEffectsTier.low implies FullCostPath(p)
+}
+
+-- GAMEPLAY NEUTRALITY (the load-bearing rule). A graphics or performance
+-- preset must never give a player a competitive advantage or disadvantage.
+-- The ACTIONABLE information set the HUD exposes is identical across every
+-- tier. A tier may shed COSMETIC richness (FCT volume and lifetime, minimap
+-- redraw smoothness, buff-icon overflow, portrait and bar redraw smoothness
+-- inside the human reaction loop); it must never change ACTIONABLE info.
+invariant GraphicsSettingsAreGameplayNeutral {
+    for p1 in GraphicsProfile:
+        for p2 in GraphicsProfile:
+            ActionableInfo(p1) = ActionableInfo(p2)
+}
+
+-- The actionable set, named explicitly so the rule cannot drift by analogy.
+-- A tier change must never remove or delay any of: the player's own debuffs;
+-- party/raid member HP; the target cast bar; target HP at usable granularity;
+-- enemy/aggro positions a player acts on. Every other shed is cosmetic.
+invariant ActionableInfoIsUntiered {
+    for p in GraphicsProfile:
+        OwnDebuffsRenderedOnEveryTier(p)
+    for p in GraphicsProfile:
+        PartyHpFullRateOnEveryTier(p)
+    for p in GraphicsProfile:
+        TargetCastBarFullRateOnEveryTier(p)
+    for p in GraphicsProfile:
+        TargetHpGranularityPreservedOnEveryTier(p)
+    for p in GraphicsProfile:
+        EnemyPositionsFullRateOnEveryTier(p)
+}
+
+-- Own debuffs are never hidden. The player has no self-dispel, so the aura
+-- icon is the only read for a DoT, curse, CC, or move-out mechanic. The
+-- aura cap on low is debuff-priority: a debuff past the buff cap still
+-- renders; full tiers are uncapped.
+invariant OwnDebuffsNeverCulled {
+    for ctx in HudContext:
+        for aura in ActiveAuras(ctx.player):
+            aura.class = AuraClass.debuff implies AuraRendered(aura)
+}
+
+-- Party frames are deliberately NOT tiered. Party member HP is a healer's
+-- only actionable signal, so it stays on the same cadence for every tier.
+-- (An earlier draft throttled it on low; the re-audit removed that.)
+invariant PartyHpFullRateEveryTier {
+    for ctx in HudContext:
+        for p in GraphicsProfile:
+            PartyCadence(ctx, p) = FullRateCadence
+}
+
+-- The target cast bar is painted OUTSIDE the target-body throttle on every
+-- tier, so interrupt timing is never degraded. A target SWAP bypasses the
+-- throttle so selecting a new target updates immediately.
+invariant TargetCastBarFullRateEveryTier {
+    for ctx in HudContext:
+        for p in GraphicsProfile:
+            TargetCastBarCadence(ctx, p) = FullRateCadence
+}
+
+-- Every damage floater is spawned on every tier, including the player's own
+-- non-crit hits. Low caps the live count and shortens the lifetime, but the
+-- number itself is never refused; crit emphasis (the scale/pop) is the only
+-- FCT cosmetic gate. Server-authoritative damage is unchanged and the HP
+-- bars and combat log carry the numbers too.
+invariant EveryFloaterSpawnedEveryTier {
+    for p in GraphicsProfile:
+        for event in DamageDealt():
+            FloaterSpawned(event, p)
+}
+
+-- Write elision is a no-op on repeat. A frame that resolves no changes
+-- performs zero DOM writes, and the single-slot and multi-slot caches never
+-- collide on the same element. This is the per-frame perf half of the
+-- presentation contract.
+invariant WriteElisionIsNoOpOnRepeat {
+    for host in PainterHost:
+        for slot in host.cache:
+            RepeatWrite(host, slot.element, slot.name, slot.value) = NoMutation
+}
+
+-- Windows share one HudContext. A window never imports a concrete
+-- coordinator; it receives a narrow dep bag and callbacks. The context owns
+-- the open-window set, focus, the PainterHost, and the profile, so the
+-- skip-rate and the tier stay one number across every window.
+invariant WindowsShareHudContext {
+    for ctx in HudContext:
+        for window in ctx.open_windows:
+            window.context = ctx
+    for ctx in HudContext:
+        for window in ctx.open_windows:
+            NotImportingCoordinator(window)
+}
+
+------------------------------------------------------------
+-- Surfaces: the player-facing windows
+------------------------------------------------------------
+
+-- The action bar. Each slot exposes its kind, its ability or item id, its
+-- keybind label, its cooldown, its resource cost and charges, and its
+-- usable / in-range / gcd-ready state. The player triggers a slot.
+surface ActionBarSurface {
+    facing player: Player
+
+    exposes:
+        for slot in player.action_bar:
+            slot.kind
+            slot.ability_id
+            slot.item_id
+            slot.keybind_label
+            slot.cooldown_remaining
+            slot.charges
+            slot.resource_cost
+            slot.usable
+            slot.range_ok
+            slot.gcd_ready
+
+    provides:
+        PlayerUsesSlot(player, slot) when slot.usable and slot.range_ok and slot.gcd_ready
+}
+
+-- The unit frames. One surface covers the self frame, the target frame, and
+-- each party member frame; all three read the same IWorld shape and differ
+-- only in which entity they render. The party frame is the healer's HP read.
+surface UnitFrameSurface {
+    facing player: Player
+
+    context self: Entity where self = player
+    context target: Entity where target = player.target
+    context members: Party where members = player.party
+
+    exposes:
+        self.hp_frac
+        self.hp_text
+        self.resource_class
+        self.resource_frac
+        for aura in self.auras:
+            aura.class
+            aura.stacks
+            aura.remaining
+        if target != null:
+            target.name
+            target.level
+            target.hp_frac
+            target.hp_text
+            target.cast
+        for member in members.members:
+            member.name
+            member.hp_frac
+            member.dead
+            member.out_of_range
+
+    provides:
+        PlayerSelectsTarget(player, entity)
+}
+
+-- The cast bar. One instance drives the player bar and a second drives the
+-- target bar. The label is localized; the fill and the remaining timer are
+-- pure. The target cast bar is full-rate on every tier (interrupt timing).
+surface CastBarSurface {
+    facing player: Player
+
+    context self: Entity where self = player
+    context target: Entity where target = player.target
+
+    exposes:
+        if self.cast != null:
+            self.cast.phase
+            self.cast.label_key
+            self.cast.remaining
+            self.cast.total
+            self.cast.progress_frac
+        if target != null and target.cast != null:
+            target.cast.phase
+            target.cast.label_key
+            target.cast.remaining
+            target.cast.progress_frac
+}
+
+-- The quest tracker. A persistent overlay that lists tracked quests with
+-- their objective progress and a collapse toggle. The collapse state and
+-- the tracked set persist across sessions.
+surface QuestTrackerSurface {
+    facing player: Player
+
+    context tracked: List<Quest> where IsTrackedSet(player, tracked)
+
+    exposes:
+        for quest in tracked:
+            quest.title
+            quest.complete
+            for obj in quest.objectives:
+                obj.label
+                obj.current
+                obj.total
+
+    provides:
+        PlayerTogglesTrack(player, quest)
+        PlayerTogglesTrackerCollapse(player)
+}
+
+-- The chat window. Exposes the channels the player has joined and the lines
+-- received on each. The player sends a line to a channel; the server routes
+-- and moderates it.
+surface ChatSurface {
+    facing player: Player
+
+    context channels: Set<ChatChannel> where JoinedBy(player, channels)
+    context lines: List<ChatLine> where VisibleTo(player, lines)
+
+    exposes:
+        for channel in channels:
+            channel.id
+            channel.name
+        for line in lines:
+            line.channel
+            line.sender
+            line.text
+            line.sent_at
+
+    provides:
+        PlayerSendsChat(player, channel, text) when text != ""
+        PlayerJoinsChannel(player, channel)
+}
+
+-- The loot window. A transient popup anchored on a corpse or delve chest.
+-- Exposes the copper and item stacks; the player takes all (the rights and
+-- roll resolution live in the sim) or harvests. Walking out of range or the
+-- source going empty closes it.
+surface LootWindowSurface {
+    facing player: Player
+
+    context corpse: Corpse where corpse.entity = player.target
+    context chest: Chest where WithinLootRange(player, chest)
+
+    exposes:
+        if corpse != null:
+            corpse.copper
+            corpse.has_loot
+            corpse.items
+        if chest != null:
+            chest.items
+
+    provides:
+        PlayerLootsCorpse(player, corpse) when WithinLootRange(player, corpse)
+        PlayerTakesAll(player, window)
+        PlayerHarvests(player, corpse)
+}

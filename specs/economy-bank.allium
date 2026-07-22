@@ -1,0 +1,627 @@
+-- allium: 3
+-- economy-bank.allium
+-- Scope: the per-character bank vault and its slot capacity, bank entitlements and bonus slots, the in-sim currencies (copper, honor), the server-side Claudium soft currency and its economy-service boundary, wallet linking, and the $WOC token firewall that keeps the sim pure.
+-- Includes: BankVault, BankEntry, EntitlementSource, BankEntitlement, Player wallet fields (copper, honor, lifetimeHonor), Wallet, WalletChallenge, WalletHandoff, WocBalance, HolderTier, ClaudiumAccount, ClaudiumSku, ClaudiumLedgerEntry, StoreEntitlement; the Deposit, Withdraw, BuyBankExpansion, StampBankBonusAtJoin, GrantHonor, SpendHonor, LinkWallet, ExpireWalletHandoff, PurchaseClaudium, SpendClaudium rules; capacity, all-or-nothing move, instanced-indivisible, banker-proximity, bonus-clamp, honor-monotonic, wallet-signature, claudium-authority, and $WOC-firewall invariants.
+-- Excludes: the storefront UI and SKU catalog display (hud spec); loot generation and corpse copper drops (items spec); PvP honor RANK mechanics, arena matchmaking, and the honor diminishing-returns curves (pvp spec); vendor stock and buyback detail (only the copper field movement is modelled); the Stripe payment-intent and Solana transaction bytes (modelled as a single authorization, not the rail wire); bank ledger row storage (the ledger is an observer of bank ops, not an authority); "cargo" is not a currency in this codebase, gather nodes yield items plus profession proficiency, so no cargo ledger is modelled.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Copper is the smallest denomination and the canonical Money unit. Gold and
+-- silver are display-only: 1 gold = 10000 copper, 1 silver = 100 copper. The
+-- sim's format_money builds the "Ng Ns Nc" fragment from this integer.
+value Money {
+  copper: Integer
+}
+
+value Usd {
+  cents: Integer
+}
+
+-- One row of the entitlement source registry: how many slots one unit of
+-- progress is worth, and the unit cap past which the source stops minting.
+value EntitlementSource {
+  sourceId: String,
+  slotsPerUnit: Integer,
+  capUnits: Integer
+}
+
+-- The raw account facts the entitlement registry reads. A missing account is
+-- all-false / zero. qualifiedReferrals is the uncapped count; the registry
+-- applies the cap.
+value BankBonusFacts {
+  emailVerified: Boolean,
+  discordLinked: Boolean,
+  walletLinked: Boolean,
+  qualifiedReferrals: Integer
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A banker NPC in the world. The sim anchors bankerIds at ctor time; every
+-- bank op scans them for a live NPC within BANKER_RANGE. Modelled as external
+-- because the bank cares only about the proximity predicate.
+entity Banker {
+  templateId: String,
+  pos: Vec3,
+  alive: Boolean
+}
+
+value Vec3 {
+  x: Integer,
+  y: Integer,
+  z: Integer
+}
+
+-- The on-chain $WOC token economy lives entirely outside the sim, behind the
+-- game server. The game never computes a peg, price, or balance; it proxies.
+entity EconomyService {
+  reachable: Boolean,
+  secretConfigured: Boolean,
+  pegCentsPerClaudium: Integer
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Player {
+  id: Integer,
+  name: String,
+  copper: Money,
+  honor: Integer,
+  lifetimeHonor: Integer,
+  holderTier: Integer,
+  dead: Boolean,
+  pos: Vec3,
+  bank: BankVault,
+  wallet: Wallet,
+  bonusFacts: BankBonusFacts
+}
+
+-- The per-character deposit box: a second pooled item store beside the carried
+-- bags. Capacity is a flat slot budget over one inventory list (nothing pins an
+-- item to a fixed cell). State is per-character and persists inside the
+-- character save.
+entity BankVault {
+  owner: Player,
+  entries: List<BankEntry>,
+  purchasedSlots: Integer,
+  bonusSlots: Integer
+}
+
+-- One bank slot. A fungible item stacks up to its stackSize; an instanced copy
+-- (signed, rolled, enchanted, or bound) is one indivisible unit with count 1.
+-- The instance payload is what makes a slot non-mergeable.
+entity BankEntry {
+  vault: BankVault,
+  itemId: String,
+  count: Integer,
+  instanced: Boolean
+}
+
+-- The per-source breakdown behind BankVault.bonusSlots, stamped at every join
+-- by the entitlement registry. Display-only session state; capacity itself
+-- rides BankVault.bonusSlots.
+entity BankEntitlement {
+  owner: Player,
+  source: EntitlementSource,
+  sourceId: String,
+  slots: Integer,
+  maxSlots: Integer
+}
+
+-- A linked Solana wallet. The chain is the source of truth; the server only
+-- observes it. No private keys, seeds, or funds ever touch the server.
+entity Wallet {
+  account: Integer,
+  address: String,
+  linkedAt: Timestamp
+}
+
+-- A short-lived, single-use signing challenge issued before a wallet link.
+entity WalletChallenge {
+  account: Integer,
+  address: String,
+  nonce: String,
+  message: String,
+  expiresAt: Timestamp,
+  consumed: Boolean
+}
+
+-- A browser-authorized wallet operation for the desktop shell (link or signed
+-- transaction). Single-use, IP-bound, TTL-limited. The authenticated desktop
+-- account polls the result.
+entity WalletHandoff {
+  account: Integer,
+  actionKind: String,
+  expiresAt: Timestamp,
+  status: pending | complete,
+  transitions status { pending -> complete, terminal: complete }
+}
+
+-- The server-cached $WOC balance for a linked wallet. Holder-tier flair is
+-- derived from this; the balance never enters the sim as gameplay state.
+entity WocBalance {
+  wallet: Wallet,
+  balance: Integer,
+  freshAt: Timestamp
+}
+
+-- The cosmetic holder tier (Ember through Sovereign). Pure function of
+-- WocBalance; the sim carries only the derived index for flair.
+entity HolderTier {
+  index: Integer,
+  key: String,
+  threshold: Integer
+}
+
+-- A Claudium soft-currency account. The balance is AUTHORITATIVE only in the
+-- external economy service; the game server holds a cached read. Null balance
+-- means the service is off or unreachable.
+entity ClaudiumAccount {
+  account: Integer,
+  balance: Integer
+}
+
+-- One rung of the USD pack ladder. Both the USD price and the Claudium credit
+-- come from the economy service; the game never invents a row or a price.
+entity ClaudiumSku {
+  sku: String,
+  usd: Usd,
+  claudium: Integer
+}
+
+-- An owned cosmetic entitlement purchased with Claudium. The economy service's
+-- grant ledger is authoritative; the game mirrors it rollback-safe.
+entity StoreEntitlement {
+  account: Integer,
+  itemId: String,
+  kind: String,
+  costClaudium: Integer
+}
+
+-- One entry in the append-only Claudius ledger (purchase credit or spend
+-- debit). Reason and reference identify the source op.
+entity ClaudiumLedgerEntry {
+  account: Integer,
+  delta: Integer,
+  reason: String,
+  reference: String,
+  atMs: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+  BANK_BASE_SLOTS: Integer = 24,
+  BANK_EXPANSION_SLOTS: Integer = 6,
+  BANK_EXPANSION_PRICES_STEPS: Integer = 12,
+  BANK_MAX_PURCHASED_SLOTS: Integer = 72,
+  BANK_MAX_BONUS_SLOTS: Integer = 16,
+  BANKER_RANGE: Integer = 7,
+  WALLET_CHALLENGE_TTL: Duration = 600,
+  WALLET_HANDOFF_TTL: Duration = 300,
+  MAX_ACTIVE_HANDOFFS: Integer = 2000,
+  CLAUDIUM_SERVICE_TIMEOUT: Duration = 5000,
+  CLAUDIUM_PEG_CENTS_PER_UNIT: Integer = 1
+}
+
+------------------------------------------------------------
+-- Surface
+------------------------------------------------------------
+
+-- The firewall boundary. The server observes the chain and the economy service
+-- and pushes a small, derived footprint INTO the sim at join: the cosmetic
+-- holder tier and the bank bonus-slot total. The sim never reaches back across
+-- this surface and never names $WOC or Claudium as gameplay state.
+surface EconomyBoundary {
+  facing server: ServerHost
+  context player: Player
+
+  provides:
+    StampHolderTier(server, player, tier)
+    StampBankBonus(server, player, bonusSlots, sources)
+    ReportBankOp(server, player, op, delta)
+}
+
+------------------------------------------------------------
+-- Bank rules
+------------------------------------------------------------
+
+-- At every join the server recomputes the bonus-slot total from the live
+-- account facts and stamps it onto the vault, overriding any persisted or
+-- tampered value. A source contributes min(units, capUnits) * slotsPerUnit;
+-- the total can never exceed BANK_MAX_BONUS_SLOTS.
+rule StampBankBonusAtJoin {
+  when: StampBankBonus(server, player, bonusSlots, sources)
+  let facts = player.bonusFacts
+  let total = SumBonus(sources, facts)
+  requires: total <= BANK_MAX_BONUS_SLOTS
+  for src in sources:
+    let earnedUnits = Min(SourceUnits(src, facts), src.capUnits)
+    let slots = earnedUnits * src.slotsPerUnit
+    ensures: BankEntitlement.created(owner = player, source = src, sourceId = src.sourceId, slots = slots, maxSlots = src.capUnits * src.slotsPerUnit)
+  ensures: player.bank.bonusSlots = total
+}
+
+-- Deposit a carried slot into the bank. Quest-kind items are refused (they are
+-- quest-bound); everything else follows the pooled capacity rules. The move is
+-- ALL-OR-NOTHING: the full requested count moves or nothing does.
+rule Deposit {
+  when: Deposit(player, slotIndex, count)
+  requires: not player.dead
+  requires: NearBanker(player)
+  requires: not IsQuestItem(player, slotIndex)
+  let vault = player.bank
+  let cap = BANK_BASE_SLOTS + vault.purchasedSlots + vault.bonusSlots
+  let entry = CarriedEntry(player, slotIndex)
+  if entry.instanced:
+    requires: vault.entries.count < cap
+    ensures: BankEntry.created(vault = vault, itemId = entry.itemId, count = 1, instanced = true)
+    ensures: RemoveCarried(player, slotIndex, 1)
+  else:
+    requires: FitsIn(vault, cap, entry.itemId, count)
+    ensures: AddToBank(vault, entry.itemId, count)
+    ensures: RemoveCarried(player, slotIndex, count)
+}
+
+-- Withdraw a bank slot back into the carried inventory. Mirror of Deposit,
+-- gated by bag capacity instead of bank capacity.
+rule Withdraw {
+  when: Withdraw(player, slotIndex, count)
+  requires: not player.dead
+  requires: NearBanker(player)
+  let entry = BankEntryAt(player.bank, slotIndex)
+  if entry.instanced:
+    requires: BagsHaveFreeSlot(player)
+    ensures: GrantCarried(player, entry.itemId, 1, true)
+    ensures: RemoveBankEntry(player.bank, slotIndex, 1)
+  else:
+    requires: FitsInBags(player, entry.itemId, count)
+    ensures: GrantCarried(player, entry.itemId, count, false)
+    ensures: RemoveBankEntry(player.bank, slotIndex, count)
+}
+
+-- Buy the next 6-slot expansion for exact copper, non-refundable. Blocked at
+-- the purchase cap and when the player cannot afford the table price; neither
+-- refusal mutates anything. The price is always the table lookup, never a
+-- client-supplied value.
+rule BuyBankExpansion {
+  when: BuyBankExpansion(player)
+  requires: not player.dead
+  requires: NearBanker(player)
+  let vault = player.bank
+  let purchases = vault.purchasedSlots / BANK_EXPANSION_SLOTS
+  requires: purchases < BANK_EXPANSION_PRICES_STEPS
+  let price = ExpansionPrice(purchases)
+  requires: player.copper.copper >= price
+  ensures: player.copper.copper = player.copper.copper - price
+  ensures: vault.purchasedSlots = vault.purchasedSlots + BANK_EXPANSION_SLOTS
+}
+
+------------------------------------------------------------
+-- Currency rules
+------------------------------------------------------------
+
+-- Every honor grant routes through one path so spendable and lifetime update
+-- together. Both clamp at MAX_SAFE_INTEGER; a malformed amount grants zero
+-- rather than minting via NaN. The event carries the larger of the credited
+-- (spendable) and earned (lifetime) deltas.
+rule GrantHonor {
+  when: GrantHonor(player, amount, reason)
+  let requested = ClampedFloor(amount)
+  requires: requested > 0
+  let credited = player.honor + requested
+  let earned = player.lifetimeHonor + requested
+  ensures: player.honor = Min(credited, MAX_SAFE_INTEGER)
+  ensures: player.lifetimeHonor = Min(earned, MAX_SAFE_INTEGER)
+  ensures: HonorGranted(player, Max(credited, earned), reason)
+}
+
+-- Spend honor at a Quartermaster. Refused when the balance is short; nothing
+-- mutates on refusal.
+rule SpendHonor {
+  when: SpendHonor(player, cost)
+  requires: cost > 0
+  requires: player.honor >= cost
+  ensures: player.honor = player.honor - cost
+}
+
+-- Vendor buy: copper leaves the player at the table copper unit price. Refused
+-- when the balance is short.
+rule SpendCopper {
+  when: SpendCopper(player, cost)
+  requires: cost >= 0
+  requires: player.copper.copper >= cost
+  ensures: player.copper.copper = player.copper.copper - cost
+}
+
+-- Vendor sell / loot copper: copper is credited to the player. A malformed
+-- payout decays to zero rather than minting.
+rule GainCopper {
+  when: GainCopper(player, amount)
+  let payout = ClampedFloor(amount)
+  requires: payout >= 0
+  ensures: player.copper.copper = player.copper.copper + payout
+}
+
+------------------------------------------------------------
+-- Wallet link rules
+------------------------------------------------------------
+
+-- Issue a short-lived, single-use challenge for a Solana address. The message
+-- binds the domain, account, address, nonce, and issued-at time.
+rule IssueWalletChallenge {
+  when: WalletChallengeRequested(player, address)
+  requires: IsValidSolanaAddress(address)
+  let nonce = FreshNonce()
+  ensures: WalletChallenge.created(account = AccountId(player), address = address, nonce = nonce, message = BuildLinkMessage(player, address, nonce), expiresAt = now + WALLET_CHALLENGE_TTL, consumed = false)
+}
+
+-- A desktop shell asks the server to authorize one browser-driven wallet
+-- operation (link or signed transaction). The entry is single-use, IP-bound,
+-- TTL-limited, and capped at MAX_ACTIVE_HANDOFFS process-wide.
+rule CreateWalletHandoff {
+  when: CreateWalletHandoff(player, actionKind)
+  requires: ActiveHandoffsCount() < MAX_ACTIVE_HANDOFFS
+  ensures: WalletHandoff.created(account = AccountId(player), actionKind = actionKind, expiresAt = now + WALLET_HANDOFF_TTL, status: pending)
+}
+
+-- Verify the signature over the stored message and link the wallet. The
+-- challenge must be unconsumed, unexpired, and address-matched; a verified
+-- ed25519 signature over the raw UTF-8 bytes is the only proof accepted. No
+-- private key ever crosses this boundary.
+rule LinkWallet {
+  when: LinkWallet(player, address, signature, nonce)
+  let challenge = ChallengeFor(nonce)
+  requires: challenge != null
+  requires: not challenge.consumed
+  requires: challenge.expiresAt > now
+  requires: challenge.address = address
+  requires: SignatureVerifies(challenge.message, signature, address)
+  requires: not AlreadyLinkedElsewhere(address)
+  ensures: challenge.consumed = true
+  ensures: Wallet.created(account = AccountId(player), address = address, linkedAt = now)
+}
+
+-- A pending desktop wallet handoff expires after its TTL. An expired handoff is
+-- reclaimable by nothing: the entry is gone.
+rule ExpireWalletHandoff {
+  when: h: WalletHandoff.expiresAt <= now
+  requires: h.status = pending
+  ensures: not exists h
+}
+
+-- A browser hands back the signed result for the desktop account to consume.
+-- The handoff is single-use: completion locks it against any second claim, and
+-- the signed address must match the authorized challenge.
+rule CompleteWalletHandoff {
+  when: CompleteWalletHandoff(player, code, signedAddress)
+  let h = HandoffFor(player, code)
+  requires: h != null
+  requires: h.status = pending
+  requires: h.expiresAt > now
+  requires: AddressMatches(h, signedAddress)
+  ensures: h.status = complete
+}
+
+------------------------------------------------------------
+-- Claudium rules
+------------------------------------------------------------
+
+-- Purchase a Claudium pack over a fiat or native rail. The economy service is
+-- the SOLE authority: it computes the peg, the price, and the credit, and
+-- returns a transaction intent for the client to fulfil. The game never
+-- recomputes any of those values. A down or unconfigured service returns a
+-- typed refusal and the game stays playable.
+rule PurchaseClaudium {
+  when: PurchaseClaudium(player, sku, rail, idempotencyKey)
+  let service = EconomyService()
+  if service.reachable and service.secretConfigured:
+    requires: exists s in ClaudiumSku where s.sku = sku
+    requires: ValidRail(rail)
+    let intent = ServicePurchase(AccountId(player), sku, rail, idempotencyKey)
+    ensures: PurchaseIntentIssued(player, intent)
+  else:
+    ensures: ServiceUnavailable(player, "purchase")
+}
+
+-- The confirmation leg settles a signed native transaction (or Stripe webhook)
+-- at the economy service. Only the service decides whether a purchase settled;
+-- on settlement it credits the Claudium balance and emits a ledger entry.
+rule ConfirmClaudiumPurchase {
+  when: ConfirmClaudium(player, reference, signature)
+  let service = EconomyService()
+  if service.reachable:
+    let settled = ServiceConfirm(AccountId(player), reference, signature)
+    if settled:
+      let credited = PurchasedClaudium(reference)
+      ensures: ClaudiumLedgerEntry.created(account = AccountId(player), delta = credited, reason = "purchase", reference = reference, atMs = now)
+      ensures: ClaudiumBalanceCredited(AccountId(player), credited)
+    else:
+      ensures: ServiceReturned(player, "confirm_unsettled")
+  else:
+    ensures: ServiceUnavailable(player, "confirm")
+}
+
+-- Spend Claudium on a store entitlement. The game sends an idempotent
+-- expected-cost spend to the service; the service is authoritative for whether
+-- the grant landed. The game then re-reads the authoritative grant ledger and
+-- mirrors ONLY the exact owned entitlement, never trusting the caller-supplied
+-- itemId from the spend response alone.
+rule SpendClaudium {
+  when: SpendClaudium(player, itemId, kind, expectedCost, idempotencyKey)
+  let service = EconomyService()
+  requires: KnownItemForKind(itemId, kind)
+  requires: expectedCost > 0
+  if service.reachable:
+    let result = ServiceSpend(AccountId(player), itemId, kind, expectedCost, idempotencyKey)
+    if result.granted or result.reason = "already_granted":
+      requires: OwnsInGrantLedger(player, itemId)
+      ensures: StoreEntitlement.created(account = AccountId(player), itemId = itemId, kind = kind, costClaudium = expectedCost)
+      ensures: ClaudiumLedgerEntry.created(account = AccountId(player), delta = 0 - expectedCost, reason = "spend", reference = idempotencyKey, atMs = now)
+    else:
+      ensures: ServiceReturned(player, result.reason)
+  else:
+    ensures: ServiceUnavailable(player, "spend")
+}
+
+-- A down service never throws into request handling: every call resolves to a
+-- typed unavailable result so the game boots and plays with the service OFF.
+rule ClaudiumServiceFailsClosed {
+  when: ClaudiumRead(player, kind)
+  let service = EconomyService()
+  if not (service.reachable and service.secretConfigured):
+    ensures: TypedUnavailable(player, kind)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Bank capacity is the sum of three contributions: the base, the copper-bought
+-- expansion blocks, and the server-stamped bonus. Over-capacity inventories
+-- are tolerated (never truncated); capacity only blocks new deposits.
+invariant BankCapacityIsAdditive {
+  for v in BankVault:
+    Capacity(v) = BANK_BASE_SLOTS + v.purchasedSlots + v.bonusSlots
+  for v in BankVault:
+    v.entries.count <= Capacity(v) or OverToleratedLegacy(v)
+}
+
+-- purchasedSlots is always a multiple of the expansion block and within the
+-- table ceiling. The price indexing depends on this.
+invariant PurchasedSlotsAreBlockAligned {
+  for v in BankVault:
+    v.purchasedSlots mod BANK_EXPANSION_SLOTS = 0
+  for v in BankVault:
+    v.purchasedSlots >= 0 and v.purchasedSlots <= BANK_MAX_PURCHASED_SLOTS
+}
+
+-- bonusSlots can never exceed what the entitlement registry can grant. A
+-- tampered or legacy save is clamped on load; a live join re-stamps the real
+-- value anyway. The registry ceiling equals the sim clamp.
+invariant BonusSlotsClampedToRegistryCeiling {
+  for v in BankVault:
+    v.bonusSlots >= 0 and v.bonusSlots <= BANK_MAX_BONUS_SLOTS
+}
+
+-- A bank entry for an instanced copy is one indivisible unit: it has count 1
+-- and never merges with a plain fungible stack of the same id. This is what
+-- keeps signed, rolled, enchanted, and bound copies non-fungible in the vault.
+invariant InstancedBankEntryIndivisible {
+  for e in BankEntry:
+    e.instanced = true implies e.count = 1
+}
+
+-- A bank move is all-or-nothing: a refused deposit or withdraw changes no
+-- state. There is no partial move.
+invariant BankMoveIsAllOrNothing {
+  for v in BankVault:
+    DepositRefused(v) implies NoMutation(v)
+  for v in BankVault:
+    WithdrawRefused(v) implies NoMutation(v)
+}
+
+-- Every bank op requires a live banker within reach. Away from a banker the
+-- vault cannot be read, deposited to, withdrawn from, or expanded.
+invariant BankerProximityRequired {
+  for p in Player:
+    Deposit(p) implies exists b in Banker where b.alive and WithinRange(b.pos, p.pos, BANKER_RANGE)
+  for p in Player:
+    Withdraw(p) implies exists b in Banker where b.alive and WithinRange(b.pos, p.pos, BANKER_RANGE)
+  for p in Player:
+    BuyBankExpansion(p) implies exists b in Banker where b.alive and WithinRange(b.pos, p.pos, BANKER_RANGE)
+}
+
+-- Honor is never negative. lifetimeHonor is monotonic and bounds the
+-- spendable balance: the total ever earned is at least the current spendable.
+invariant HonorNonNegativeAndLifetimeMonotonic {
+  for p in Player:
+    p.honor >= 0
+  for p in Player:
+    p.lifetimeHonor >= p.honor
+}
+
+-- Copper is never negative. A refused spend changes no state.
+invariant CopperNonNegative {
+  for p in Player:
+    p.copper.copper >= 0
+}
+
+-- The sim never names $WOC or Claudium as gameplay state. $WOC balance, the
+-- wallet address, and the Claudium balance all live server-side; the sim
+-- carries only the derived cosmetic holderTier index and a server-stamped
+-- bonus-slot integer. No gameplay rule reads a balance, a wallet, or a
+-- Claudium amount.
+invariant WocTokenFirewall {
+  for b in WocBalance:
+    ServerHoldsOnly(b)
+  for t in HolderTier:
+    DerivedFromBalance(t)
+  for p in Player:
+    not SimReadsWocBalance(p)
+  for p in Player:
+    not SimReadsClaudiumBalance(p)
+}
+
+-- The Claudium balance is authoritative only in the economy service. The game
+-- holds a cached read; a null balance means the service is off or unreachable,
+-- and no gameplay branch reads it as a spendable amount.
+invariant ClaudiumBalanceIsServerHeld {
+  for c in ClaudiumAccount:
+    ServerCachedOnly(c)
+}
+
+-- The economy service is the sole authority for Claudium: the game computes no
+-- peg, price, or balance. A down or unconfigured service resolves every call
+-- to a typed unavailable result and never throws up into request handling; the
+-- game boots and plays with the service OFF.
+invariant ClaudiumServiceIsSoleAuthority {
+  for s in EconomyService:
+    not GameComputesClaudiumPeg(s)
+  for s in EconomyService:
+    not GameComputesClaudiumPrice(s)
+  for s in EconomyService:
+    not GameComputesClaudiumBalance(s)
+  for s in EconomyService:
+    (not s.reachable or not s.secretConfigured) implies FailsClosed(s)
+}
+
+-- Wallet linking proves ownership by a signature over a single-use challenge.
+-- No private key, seed, or fund ever touches the server, and a consumed or
+-- expired challenge cannot link anything.
+invariant WalletLinkRequiresSignature {
+  for w in Wallet:
+    exists c in WalletChallenge where VerifiesLink(c, w)
+  for c in WalletChallenge:
+    c.consumed = true implies not CanLink(c)
+  for c in WalletChallenge:
+    c.expiresAt <= now implies not CanLink(c)
+}
+
+-- A desktop wallet handoff is single-use, IP-bound, and TTL-limited. A
+-- completed handoff cannot be claimed again; an expired one is gone.
+invariant WalletHandoffSingleUse {
+  for h in WalletHandoff:
+    h.status = complete implies not CanClaim(h)
+  for h in WalletHandoff:
+    h.expiresAt <= now implies Expired(h)
+  for h in WalletHandoff:
+    ActiveHandoffsCount() <= MAX_ACTIVE_HANDOFFS
+}
+
+-- A bank op observer (the bank ledger) is never an authority. It diffs the
+-- public bank snapshot before and after a dispatch and records only what
+-- changed; an empty diff writes nothing. The observer can never throw into the
+-- gameplay path or block a dispatch.
+invariant BankLedgerIsObserverNotAuthority {
+  for v in BankVault:
+    NoBankMutationFromLedger(v)
+}
