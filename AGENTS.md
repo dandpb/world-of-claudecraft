@@ -51,6 +51,19 @@ Repository skills live in `.agents/skills/` and are invoked as `$skill-name`:
 - `$woc-codex-audit`: compare the checked-in Codex architecture with current official
   guidance.
 
+## Routing hierarchy
+
+High-traffic boundaries add Codex-specific routing without duplicating the canonical
+`CLAUDE.md` facts:
+
+| Area | Codex guide | Canonical facts |
+|---|---|---|
+| Client and shared source | `src/AGENTS.md` | `src/CLAUDE.md` plus the nearest local `CLAUDE.md` |
+| Authoritative server | `server/AGENTS.md` | `server/CLAUDE.md` |
+| REST pipeline | `server/http/AGENTS.md` | `server/http/CLAUDE.md` |
+| Test suite | `tests/AGENTS.md` | `tests/CLAUDE.md` |
+| Repository tooling | `scripts/AGENTS.md` | `scripts/CLAUDE.md` |
+
 Read-only specialist agents live in `.codex/agents/`. Use only the roles matching the
 changed surface: sim architecture, cross-platform parity, persistence, database
 performance, security, test coverage, frontend, release malware, and official

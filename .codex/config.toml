@@ -1,11 +1,18 @@
 #:schema https://developers.openai.com/codex/config-schema.json
 
-# Keep model, effort, permissions, auth, and provider choices at the user or session
-# layer. This project config only makes canonical repository guidance discoverable and
-# bounds native parallelism.
+# This project config makes canonical repository guidance discoverable, bounds native
+# parallelism, and sets the shared model baseline for Codex sessions. Permissions, auth,
+# and provider account choices stay at the user or session layer.
 project_doc_fallback_filenames = ["CLAUDE.md"]
 project_doc_max_bytes = 65536
 
+model = "gpt-5.6-sol"
+model_context_window = 372000
+model_reasoning_effort = "high"
+plan_mode_reasoning_effort = "xhigh"
+
 [agents]
-max_threads = 6
 max_depth = 1
+
+[features.multi_agent_v2]
+max_concurrent_threads_per_session = 16
