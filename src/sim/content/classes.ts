@@ -119,7 +119,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'deep_wounds',
       'enrage_passive',
     ],
-    color: 0xc79c6e,
+    color: 0xd67a54,
   },
   mage: {
     id: 'mage',
@@ -207,7 +207,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'perfect_moment',
       'fireball_form',
     ],
-    color: 0x69ccf0,
+    color: 0x33c1f1,
   },
   rogue: {
     id: 'rogue',
@@ -247,7 +247,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'stealth',
       'kick',
     ],
-    color: 0xfff569,
+    color: 0xfcee58,
   },
   paladin: {
     id: 'paladin',
@@ -280,7 +280,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'rebuke',
       'sacred_bulwark',
     ],
-    color: 0xf58cba,
+    color: 0xf58ca0,
   },
   hunter: {
     id: 'hunter',
@@ -314,7 +314,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'volley',
       'counter_shot',
     ],
-    color: 0xabd473,
+    color: 0xa6d84f,
   },
   priest: {
     id: 'priest',
@@ -342,7 +342,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'mind_flay',
       'flash_heal',
     ],
-    color: 0xfffff0,
+    color: 0xc6d4f0,
   },
   shaman: {
     id: 'shaman',
@@ -370,7 +370,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'ghost_wolf',
       'earthquake',
     ],
-    color: 0x0070de,
+    color: 0x4e8aea,
   },
   warlock: {
     id: 'warlock',
@@ -407,7 +407,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'rain_of_fire',
       'spell_lock',
     ],
-    color: 0x9482c9,
+    color: 0xa785e6,
   },
   druid: {
     id: 'druid',
@@ -463,7 +463,7 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'skull_bash',
       'primal_reflexes',
     ],
-    color: 0xff7d0a,
+    color: 0xff8c1a,
   },
 };
 
@@ -2948,7 +2948,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     ranks: [
       { rank: 2, level: 8, cost: 50, effects: [{ type: 'heal', min: 76, max: 90 }] },
       { rank: 3, level: 14, cost: 70, effects: [{ type: 'heal', min: 122, max: 144 }] },
-      { rank: 4, level: 20, cost: 115, effects: [{ type: 'heal', min: 190, max: 222 }] },
+      { rank: 4, level: 20, cost: 117, effects: [{ type: 'heal', min: 275, max: 322 }] },
     ],
     description: 'Heals a friendly target for $d.',
   },
@@ -3097,6 +3097,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     requiresTarget: true,
     targetType: 'friendly',
     effects: [{ type: 'heal', min: 62, max: 76 }],
+    ranks: [{ rank: 2, level: 20, cost: 46, effects: [{ type: 'heal', min: 90, max: 110 }] }],
     description: 'A quick, efficient flash of Light that heals a friendly target for $d.',
   },
   exorcism: {
@@ -3479,6 +3480,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     ranks: [
       { rank: 2, level: 6, cost: 45, effects: [{ type: 'heal', min: 72, max: 86 }] },
       { rank: 3, level: 12, cost: 65, effects: [{ type: 'heal', min: 110, max: 132 }] },
+      { rank: 4, level: 20, cost: 85, effects: [{ type: 'heal', min: 160, max: 192 }] },
     ],
     description: 'Heals a friendly target for $d.',
   },
@@ -3541,6 +3543,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     ranks: [
       { rank: 2, level: 12, cost: 70, effects: [{ type: 'absorb', amount: 90, duration: 30 }] },
       { rank: 3, level: 18, cost: 100, effects: [{ type: 'absorb', amount: 145, duration: 30 }] },
+      { rank: 4, level: 20, cost: 130, effects: [{ type: 'absorb', amount: 210, duration: 30 }] },
     ],
     description: 'Shields the target, absorbing $d damage for 30 sec.',
   },
@@ -3568,7 +3571,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
         rank: 3,
         level: 20,
         cost: 75,
-        effects: [{ type: 'hot', total: 140, duration: 15, interval: 3 }],
+        effects: [{ type: 'hot', total: 205, duration: 15, interval: 3 }],
       },
     ],
     description: 'Heals the target for $d over 15 sec.',
@@ -3604,7 +3607,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     requiresTarget: true,
     targetType: 'friendly',
     effects: [{ type: 'heal', min: 165, max: 195 }],
-    ranks: [{ rank: 2, level: 20, cost: 130, effects: [{ type: 'heal', min: 230, max: 270 }] }],
+    ranks: [{ rank: 2, level: 20, cost: 130, effects: [{ type: 'heal', min: 335, max: 390 }] }],
     description: 'A slow but powerful prayer that heals a friendly target for $d.',
   },
   mind_flay: {
@@ -3635,7 +3638,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     school: 'holy',
     requiresTarget: true,
     targetType: 'friendly',
-    effects: [{ type: 'heal', min: 120, max: 142 }],
+    effects: [{ type: 'heal', min: 174, max: 206 }],
     description: 'A fast prayer that heals a friendly target for $d.',
   },
 
@@ -3744,6 +3747,13 @@ export const ABILITIES: Record<string, AbilityDef> = {
         cost: 90,
         castTime: 2.5,
         effects: [{ type: 'heal', min: 138, max: 164 }],
+      },
+      {
+        rank: 5,
+        level: 20,
+        cost: 115,
+        castTime: 2.5,
+        effects: [{ type: 'heal', min: 200, max: 238 }],
       },
     ],
     description: 'Heals a friendly target for $d.',
@@ -4333,7 +4343,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     ranks: [
       { rank: 2, level: 8, cost: 45, castTime: 3.0, effects: [{ type: 'heal', min: 68, max: 86 }] },
       { rank: 3, level: 14, cost: 75, effects: [{ type: 'heal', min: 115, max: 140 }] },
-      { rank: 4, level: 20, cost: 110, effects: [{ type: 'heal', min: 175, max: 208 }] },
+      { rank: 4, level: 20, cost: 110, effects: [{ type: 'heal', min: 254, max: 302 }] },
     ],
     description: 'Heals a friendly target for $d.',
   },
@@ -4422,7 +4432,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
         rank: 4,
         level: 20,
         cost: 80,
-        effects: [{ type: 'hot', total: 116, duration: 12, interval: 3 }],
+        effects: [{ type: 'hot', total: 168, duration: 12, interval: 3 }],
       },
     ],
     description: 'Heals the target for $d over 12 sec.',
@@ -4494,7 +4504,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     requiresTarget: false,
     effects: [{ type: 'selfBuff', kind: 'form_bear', value: 0.65, duration: 3600 }],
     description:
-      'Shapeshift into a bear: armor +90%, greatly increased attack power, your attacks build rage and generate 30% more threat. Cast again to return to caster form.',
+      'Shapeshift into a bear: armor +130%, greatly increased attack power, your attacks build rage and generate 30% more threat. Cast again to return to caster form.',
   },
   bear_charge: {
     id: 'bear_charge',
@@ -4711,6 +4721,17 @@ export const ABILITIES: Record<string, AbilityDef> = {
     effects: [
       { type: 'heal', min: 52, max: 62 },
       { type: 'hot', total: 49, duration: 21, interval: 3 },
+    ],
+    ranks: [
+      {
+        rank: 2,
+        level: 20,
+        cost: 72,
+        effects: [
+          { type: 'heal', min: 75, max: 90 },
+          { type: 'hot', total: 71, duration: 21, interval: 3 },
+        ],
+      },
     ],
     description: 'Heals a friendly target for $d and an additional amount over 21 sec.',
   },
@@ -5252,6 +5273,10 @@ export const ABILITIES: Record<string, AbilityDef> = {
     school: 'physical',
     requiresTarget: false,
     offGcd: true,
+    // The whole point of the break is escaping fear/stun, so the cast must be
+    // pressable while controlled (like Ice Block); the stun gate would
+    // otherwise make breakControl unreachable exactly when it matters.
+    usableWhileControlled: true,
     effects: [
       { type: 'breakControl' },
       // ONE aura for both halves (value = damage amp; the body scale is the
@@ -5260,7 +5285,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
       { type: 'selfBuff', kind: 'buff_avatar', value: 0.2, duration: 20 },
     ],
     description:
-      'Transform into a colossus for 20 sec, breaking all control on you and increasing your damage dealt by 20%.',
+      'Transform into a colossus for 20 sec, breaking enemy control effects on you (boss control is unaffected) and increasing your damage dealt by 20%.',
   },
   sanguine_aura: {
     id: 'sanguine_aura',
@@ -5331,6 +5356,17 @@ export const ABILITIES: Record<string, AbilityDef> = {
     effects: [
       { type: 'heal', min: 40, max: 50 },
       { type: 'directDamage', min: 40, max: 50 },
+    ],
+    ranks: [
+      {
+        rank: 2,
+        level: 20,
+        cost: 72,
+        effects: [
+          { type: 'heal', min: 58, max: 73 },
+          { type: 'directDamage', min: 40, max: 50 },
+        ],
+      },
     ],
     description:
       'Shocks a friendly target with Holy energy to heal them, or an enemy for $d Holy damage. (Holy signature)',
@@ -5558,6 +5594,17 @@ export const ABILITIES: Record<string, AbilityDef> = {
     effects: [
       { type: 'aoeHeal', min: 34, max: 42, radius: 10 },
       { type: 'aoeDamage', min: 24, max: 30, radius: 10 },
+    ],
+    ranks: [
+      {
+        rank: 2,
+        level: 20,
+        cost: 90,
+        effects: [
+          { type: 'aoeHeal', min: 49, max: 61, radius: 10 },
+          { type: 'aoeDamage', min: 24, max: 30, radius: 10 },
+        ],
+      },
     ],
     description:
       'Causes an explosion of Mending Light, healing nearby allies for $d and damaging nearby enemies. (Holy signature)',
