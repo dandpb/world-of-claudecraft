@@ -2,10 +2,18 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   CONSTRAINED_PREWARM_KEEP,
+  CONSTRAINED_PREWARM_RESUME,
   constrainedEntryViewCreateBudget,
+  interactionLandmarkViewPriority,
+  mandatoryLandmarkViewsReady,
+  NEARBY_LANDMARK_STREAM_RADIUS,
   orderedPrewarmIds,
   type PrewarmPolicyInput,
+  partitionMandatoryLandmarkCandidates,
+  prewarmBuildDeadline,
+  prewarmEntryResumesAfterSkip,
   prewarmEntryRuns,
+  prewarmEntryShouldDefer,
   remainingPrewarmViewBudget,
   resolvePrewarmPolicy,
 } from '../src/render/prewarm_policy';
@@ -16,6 +24,7 @@ const BASE: PrewarmPolicyInput = {
   constrainedMemory: false,
   asyncCompileSupported: true,
   lowGfx: false,
+  finishFullManifestBeforeReveal: false,
   defaultMaxMs: 12000,
   constrainedMaxMs: 5000,
   defaultCompileMaxMs: 10000,
@@ -28,6 +37,8 @@ const BASE: PrewarmPolicyInput = {
 // The full manifest id order the renderer builds, for the reorder tests.
 const MANIFEST_IDS = [
   'views.required',
+  'views.landmarks',
+  'views.persistent-portals',
   'views.nearby',
   'props.dungeon-doors',
   'interiors.materials',
@@ -57,6 +68,42 @@ describe('resolvePrewarmPolicy: unconstrained (desktop) reproduces historical be
     expect(p.linkPassPerEntry).toBe(false);
     expect(p.compileBeforeFirstFrame).toBe(false);
     expect(p.skipMonolithCompile).toBe(false);
+    expect(p.finishFullManifestBeforeReveal).toBe(false);
+  });
+
+  it('keeps the complete desktop Insane manifest behind the entry cover', () => {
+    const p = resolvePrewarmPolicy({ ...BASE, finishFullManifestBeforeReveal: true });
+    expect(p.finishFullManifestBeforeReveal).toBe(true);
+
+    const renderer = readFileSync(new URL('../src/render/renderer.ts', import.meta.url), 'utf8');
+    expect(renderer).toContain(
+      "finishFullManifestBeforeReveal: GFX.tier === 'insane' && !GFX.constrainedMemory",
+    );
+    expect(renderer).toContain(
+      'const buildDeadline = prewarmBuildDeadline(\n      deadline,\n      PREWARM_BUILD_RESERVE_MS,\n      policy.finishFullManifestBeforeReveal,\n    );',
+    );
+    expect(renderer).toContain(
+      'prewarmEntryShouldDefer(\n          entryStarted,\n          deadline,\n          entry.deadlineExempt ?? false,\n          policy.finishFullManifestBeforeReveal,\n        )',
+    );
+    expect(renderer).toContain(
+      'this.createPersistentPortalViews(\n            createdViewTypes,\n            buildDeadline,',
+    );
+    expect(renderer).toContain(
+      'this.createCandidateViews(\n            remainingPrewarmViewBudget(policy.maxViews, createdViews),\n            createdViewTypes,\n            buildDeadline,',
+    );
+  });
+
+  it('never defers full-manifest entries and does not trim their archetype build', () => {
+    expect(prewarmEntryShouldDefer(12_000, 12_000, false, true)).toBe(false);
+    expect(prewarmEntryShouldDefer(20_000, 12_000, false, true)).toBe(false);
+    expect(prewarmBuildDeadline(12_000, 3_000, true)).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('keeps the ordinary soft deadline and explicit exemption behavior', () => {
+    expect(prewarmEntryShouldDefer(11_999, 12_000, false, false)).toBe(false);
+    expect(prewarmEntryShouldDefer(12_000, 12_000, false, false)).toBe(true);
+    expect(prewarmEntryShouldDefer(12_000, 12_000, true, false)).toBe(false);
+    expect(prewarmBuildDeadline(12_000, 3_000, false)).toBe(9_000);
   });
 
   it('uses the low view cap on the low tier', () => {
@@ -83,6 +130,7 @@ describe('resolvePrewarmPolicy: constrained with parallel compile (the iPhone pa
     // The production-hub fix: only self plus one required/nearby view may build
     // synchronously at entry, never a crowd that reveals on the first live submit.
     expect(p.maxViews).toBe(2);
+    expect(p.finishFullManifestBeforeReveal).toBe(false);
   });
 
   it('yields the event loop, compiles before the first frame, and keeps the monolith', () => {
@@ -115,9 +163,7 @@ describe('resolvePrewarmPolicy: constrained with parallel compile (the iPhone pa
   it('wires the two-view constrained cap into the renderer', () => {
     const renderer = readFileSync(new URL('../src/render/renderer.ts', import.meta.url), 'utf8');
     expect(renderer).toContain('const VIEW_PREWARM_MAX_VIEWS_CONSTRAINED = 2;');
-    expect(renderer).toContain(
-      'this.createPersistentPortalViews(\n            createdViewTypes,\n            deadline,\n            remainingPrewarmViewBudget(policy.maxViews, createdViews),\n          )',
-    );
+    expect(renderer).toContain('remainingPrewarmViewBudget(policy.maxViews, createdViews)');
   });
 
   it('moves programs.compile to just before world.initial-frame', () => {
@@ -177,11 +223,214 @@ describe('the keep-list is the minimal entry set', () => {
         'programs.compile',
         'render.settle-passes',
         'textures.scene',
+        'views.landmarks',
         'views.nearby',
+        'views.persistent-portals',
         'views.required',
         'world.initial-frame',
       ].sort(),
     );
+  });
+});
+
+describe('constrained skips that still resume in the background', () => {
+  const constrained = resolvePrewarmPolicy({ ...BASE, constrainedMemory: true });
+  const desktop = resolvePrewarmPolicy(BASE);
+
+  it('skips the ability-VFX warm-up at entry but keeps its units', () => {
+    // Both halves matter: skipping keeps the entry window short, resuming is
+    // what stops the six impact sheets from being drawn on the first spell
+    // impact of each school, i.e. mid-combat.
+    expect(prewarmEntryRuns('vfx.ability-primitives', constrained)).toBe(false);
+    expect(prewarmEntryResumesAfterSkip('vfx.ability-primitives', constrained)).toBe(true);
+  });
+
+  it('never resumes an entry skipped for its GPU footprint', () => {
+    for (const id of [
+      'entities.mob-archetypes',
+      'entities.npc-archetypes',
+      'sky.biome-variants',
+      'surface-detail.textures',
+      'vfx.atlas',
+    ]) {
+      expect(prewarmEntryRuns(id, constrained)).toBe(false);
+      expect(prewarmEntryResumesAfterSkip(id, constrained)).toBe(false);
+    }
+  });
+
+  it('is inert on the desktop manifest, which runs the entry outright', () => {
+    expect(prewarmEntryRuns('vfx.ability-primitives', desktop)).toBe(true);
+    expect(prewarmEntryResumesAfterSkip('vfx.ability-primitives', desktop)).toBe(false);
+  });
+
+  it('keeps the resume list disjoint from the keep-list', () => {
+    expect(CONSTRAINED_PREWARM_RESUME.length).toBeGreaterThan(0);
+    for (const id of CONSTRAINED_PREWARM_RESUME) {
+      expect(CONSTRAINED_PREWARM_KEEP).not.toContain(id);
+    }
+  });
+});
+
+describe('mandatory interaction-landmark prewarm', () => {
+  const entities = [
+    { id: 10, kind: 'npc', templateId: 'flight_master', pos: { x: 3, z: -2 } },
+    { id: 20, kind: 'object', templateId: 'mailbox', pos: { x: 0, z: -7.5 } },
+    {
+      id: 30,
+      kind: 'object',
+      templateId: 'noticeboard_eastbrook',
+      pos: { x: 10, z: -8 },
+    },
+    { id: 40, kind: 'object', templateId: 'dungeon_door', pos: { x: 75, z: 75 } },
+  ];
+
+  it('selects the spawn mailbox ahead of nearby NPCs and a remote persistent portal', () => {
+    const partition = partitionMandatoryLandmarkCandidates(entities, { x: 2, z: -2 });
+    expect(partition.mandatory.map((entity) => entity.id)).toEqual([20]);
+    expect([...partition.mandatory, ...partition.ordinary].map((entity) => entity.id)).toEqual([
+      20, 10, 30, 40,
+    ]);
+  });
+
+  it('selects only the noticeboard from a board-adjacent entry position', () => {
+    const partition = partitionMandatoryLandmarkCandidates(entities, { x: 10, z: -6 });
+    expect(partition.mandatory.map((entity) => entity.id)).toEqual([30]);
+  });
+
+  it('selects both landmarks when their authored interaction radii overlap', () => {
+    const partition = partitionMandatoryLandmarkCandidates(entities, { x: 6.5, z: -8 });
+    expect(partition.mandatory.map((entity) => entity.id)).toEqual([20, 30]);
+  });
+
+  it('excludes landmarks outside their authored mailbox 7 and noticeboard 4 radii', () => {
+    const partition = partitionMandatoryLandmarkCandidates(entities, { x: 100, z: 100 });
+    expect(partition.mandatory).toEqual([]);
+    expect(partition.ordinary.map((entity) => entity.id)).toEqual([10, 20, 30, 40]);
+  });
+
+  it('streams nearby service landmarks before NPCs without promoting remote ones', () => {
+    const nearSq = NEARBY_LANDMARK_STREAM_RADIUS * NEARBY_LANDMARK_STREAM_RADIUS;
+    expect(interactionLandmarkViewPriority('mailbox', nearSq)).toBe(0.5);
+    expect(interactionLandmarkViewPriority('noticeboard_eastbrook', nearSq + 1)).toBe(1.5);
+    expect(interactionLandmarkViewPriority('ore_iron', 0)).toBeNull();
+    expect(interactionLandmarkViewPriority(null, 0)).toBeNull();
+  });
+
+  it('does not report ready while any mandatory view is absent or compile-pending', () => {
+    const requiredIds = [20, 30];
+    expect(
+      mandatoryLandmarkViewsReady(requiredIds, new Map([[20, { compilePending: false }]])),
+    ).toBe(false);
+    expect(
+      mandatoryLandmarkViewsReady(
+        requiredIds,
+        new Map([
+          [20, { compilePending: false }],
+          [30, { compilePending: true }],
+        ]),
+      ),
+    ).toBe(false);
+    expect(
+      mandatoryLandmarkViewsReady(
+        requiredIds,
+        new Map([
+          [20, { compilePending: false }],
+          [30, { compilePending: false }],
+        ]),
+      ),
+    ).toBe(true);
+  });
+
+  it('runs the bounded landmark step before persistent portals and generic candidates', () => {
+    const policy = resolvePrewarmPolicy({
+      ...BASE,
+      constrainedMemory: true,
+      asyncCompileSupported: true,
+    });
+    const ordered = orderedPrewarmIds(MANIFEST_IDS, policy).filter((id) =>
+      prewarmEntryRuns(id, policy),
+    );
+    expect(ordered.indexOf('views.landmarks')).toBeLessThan(
+      ordered.indexOf('views.persistent-portals'),
+    );
+    expect(ordered.indexOf('views.landmarks')).toBeLessThan(ordered.indexOf('views.nearby'));
+
+    const renderer = readFileSync(new URL('../src/render/renderer.ts', import.meta.url), 'utf8');
+    const landmarkEntryAt = renderer.indexOf("id: 'views.landmarks'");
+    const portalEntryAt = renderer.indexOf("id: 'views.persistent-portals'");
+    const nearbyEntryAt = renderer.indexOf("id: 'views.nearby'");
+    expect(landmarkEntryAt).toBeGreaterThan(-1);
+    expect(portalEntryAt).toBeGreaterThan(landmarkEntryAt);
+    expect(nearbyEntryAt).toBeGreaterThan(portalEntryAt);
+    expect(renderer.slice(landmarkEntryAt, portalEntryAt)).toContain('deadlineExempt: true');
+
+    const helperStart = renderer.indexOf('private async createMandatoryLandmarkViews(');
+    const helperEnd = renderer.indexOf('\n  private createPersistentPortalViews(', helperStart);
+    const helper = renderer.slice(helperStart, helperEnd);
+    const partitionAt = helper.indexOf('partitionMandatoryLandmarkCandidates(');
+    const createAt = helper.indexOf('this.createView(entity)');
+    const compileWaitAt = helper.indexOf('await Promise.all(compileWaits)');
+    const readinessAt = helper.indexOf('mandatoryLandmarkViewsReady(ids, this.views)');
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helperEnd).toBeGreaterThan(helperStart);
+    expect(partitionAt).toBeGreaterThan(-1);
+    expect(createAt).toBeGreaterThan(partitionAt);
+    expect(compileWaitAt).toBeGreaterThan(createAt);
+    expect(readinessAt).toBeGreaterThan(compileWaitAt);
+    expect(helper).not.toContain('remainingPrewarmViewBudget');
+  });
+
+  it('serializes parallel compile readiness and makes the no-parallel path immediate', () => {
+    // #2571 commit 2 extracted the compile wait that used to be inline here
+    // into a shared coordinator (compileGate delegating to CompileGateQueue, see
+    // src/render/compile_gate.ts) so gateSwapOnCompile/gateSwapFlagOnCompile
+    // could reuse it instead of duplicating it. gateViewOnCompile itself still
+    // owns the unsupported-browser short-circuit and the compilePending
+    // lifecycle; sequencing and timeout diagnostics now live one hop over.
+    const renderer = readFileSync(new URL('../src/render/renderer.ts', import.meta.url), 'utf8');
+    const gateStart = renderer.indexOf('private gateViewOnCompile(');
+    const gateEnd = renderer.indexOf('\n  /** The visual the player currently sees', gateStart);
+    const gate = renderer.slice(gateStart, gateEnd);
+    expect(gateStart).toBeGreaterThan(-1);
+    expect(gateEnd).toBeGreaterThan(gateStart);
+    expect(gate).toContain('if (!this.asyncCompileSupported) return null;');
+    expect(gate).toContain('this.compileGate(group)');
+    expect(gate).toContain('view.compilePending = false;');
+    expect(gate).toContain(
+      'The canvas nameplate (name, target marker, health, and cast bar) keeps',
+    );
+    expect(gate).toContain('void this.compileGate(target).then(');
+    expect(gate.match(/this\.recoverRejectedCompileGate\(/g)).toHaveLength(3);
+    expect(gate).toContain('group.visible = priorVisibility;');
+    expect(gate).toContain('this.recoverRejectedCompileGate(error, generation, onSettled);');
+    expect(gate).not.toContain('onTimeout');
+
+    const compileGateStart = renderer.indexOf('private compileGate(');
+    const compileGateEnd = renderer.indexOf('private gateViewOnCompile(', compileGateStart);
+    const compileGate = renderer.slice(compileGateStart, compileGateEnd);
+    expect(compileGateStart).toBeGreaterThan(-1);
+    expect(compileGateEnd).toBeGreaterThan(compileGateStart);
+    expect(compileGate).toContain('this.liveCompileGates.run(');
+    expect(compileGate).toContain('VIEW_COMPILE_GATE_MAX_MS');
+    expect(compileGate).not.toContain('onTimeout');
+    expect(renderer).toContain('return GPU_WORK_PRIORITY.ACTIONABLE_VIEW;');
+    expect(renderer).toContain(
+      'private readonly liveCompileGates = new CompileGateQueue(this.backgroundGpuWork)',
+    );
+
+    // The non-cancelling timeout and serial queue, plus dedicated coverage, now
+    // live in the shared core: tests/compile_gate.test.ts drives its actual
+    // behavior (waits past timeout, settles on compile/rejection, serializes
+    // concurrent gates); this pin
+    // only confirms the mechanics still exist in source, not duplicated back
+    // into gateViewOnCompile.
+    const core = readFileSync(new URL('../src/render/compile_gate.ts', import.meta.url), 'utf8');
+    expect(core).toContain('export class CompileGateQueue');
+    expect(core).toContain('timedOut = true;');
+    expect(core).toContain(
+      'if (this.sharedQueue) return this.sharedQueue.run(work, options.priority)',
+    );
+    expect(core).toContain('this.tail.then(work)');
   });
 });
 

@@ -1,4 +1,4 @@
-// @vitest-environment jsdom
+// @vitest-environment happy-dom
 
 // Painter pins for the train window's card treatment: the two-arm fee
 // rendering (the gold action chip on an AFFORDABLE teachable row only, the
@@ -11,7 +11,7 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ITEMS } from '../src/sim/data';
 import type { TrainRow, TrainView } from '../src/ui/hud/vendor/train_view';
 import { renderTrainWindow } from '../src/ui/hud/vendor/train_window';
@@ -92,6 +92,49 @@ describe('renderTrainWindow fee arms (gold chip on affordable rows ONLY)', () =>
   });
 });
 
+describe('renderTrainWindow pending rows (learn in flight, issue #2342)', () => {
+  it('a pending teachable row disables the button and swaps to the in-flight label', () => {
+    const el = paint([row({ pending: true })]);
+    const button = el.querySelector('.train-teachable') as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.querySelector('.train-state')?.textContent).toBe('Learning');
+    // The accessible name must carry the in-flight state too: aria-label
+    // overrides element content, so the visible pill alone never reaches AT.
+    expect(button.getAttribute('aria-label')).toBe('Learning Eastbrook Arming Sword');
+    // The fee chip stays (the row is still affordable; the disabled opacity
+    // mutes it), per the vendor-family price-rendering contract.
+    expect(button.querySelector('.vi-price-chip')).not.toBeNull();
+  });
+
+  it('a disabled pending button never reaches onTrain, an enabled row does', () => {
+    const d = deps();
+    const el = document.createElement('div');
+    const view: TrainView = {
+      stationType: 'forge',
+      rows: [row({ pending: true }), row({ recipeId: 'r_live' })],
+    };
+    renderTrainWindow(el, 'Darva', view, d);
+    const [pendingButton, liveButton] = Array.from(
+      el.querySelectorAll<HTMLButtonElement>('.train-teachable'),
+    );
+    pendingButton.click();
+    expect(d.onTrain).not.toHaveBeenCalled();
+    liveButton.click();
+    expect(d.onTrain).toHaveBeenCalledWith('r_live');
+  });
+
+  it('a non-pending row keeps the Available label and the Learn-for-fee aria arm', () => {
+    const el = paint([row({})]);
+    expect(el.querySelector('.train-state')?.textContent).toBe('Available');
+    // The aria-label rides its OWN ternary, independent of the visible label:
+    // pin the non-pending arm too, or an inverted ternary that always
+    // announces the pending copy would leave every visible pin green.
+    const aria = el.querySelector('.train-teachable')?.getAttribute('aria-label') ?? '';
+    expect(aria).toMatch(/^Learn Eastbrook Arming Sword for /);
+    expect(aria).not.toContain('Learning');
+  });
+});
+
 describe('renderTrainWindow quality-glow socket', () => {
   it('every row carries the shared socket span, glowing from the item quality', () => {
     const el = paint([
@@ -130,5 +173,107 @@ describe('train/unbind card hover restores (CSS source pins)', () => {
     const rule = css.slice(start, css.indexOf('}', start));
     expect(rule).toContain('background: rgba(0, 0, 0, 0.24)');
     expect(rule).not.toContain('background: transparent');
+  });
+});
+
+describe('renderTrainWindow keyboard focus carry (uninitiated rebuilds)', () => {
+  // Inventory and purse deltas repaint an open window uninitiated (#2931), so
+  // the painter must carry keyboard focus across its full-subtree wipe (the
+  // focus-across-a-REBUILD contract, vendor_window idiom). Roots attach to
+  // document.body: focus() and activeElement are inert on a detached tree.
+  function paintInto(el: HTMLElement, rows: TrainRow[]): void {
+    renderTrainWindow(el, 'Darva', { stationType: 'forge', rows }, deps());
+  }
+  function attachedRoot(): HTMLElement {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    return el;
+  }
+  // A mid-test failure must not leak a focused node into the shared document
+  // for later tests in the file.
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('keeps focus on the same recipe row across a repaint', () => {
+    const el = attachedRoot();
+    paintInto(el, [row({ recipeId: 'recipe_a' }), row({ recipeId: 'recipe_b' })]);
+    const first = el.querySelector<HTMLButtonElement>('[data-focus-key="learn:recipe_a"]');
+    first?.focus();
+    expect(document.activeElement).toBe(first);
+    paintInto(el, [row({ recipeId: 'recipe_a' }), row({ recipeId: 'recipe_b' })]);
+    // The node was rebuilt, so identity moved; the key must not.
+    expect((document.activeElement as HTMLElement).dataset.focusKey).toBe('learn:recipe_a');
+    el.remove();
+  });
+
+  it('falls to the ladder neighbor when the focused row came back disabled', () => {
+    const el = attachedRoot();
+    paintInto(el, [row({ recipeId: 'recipe_a' }), row({ recipeId: 'recipe_b' })]);
+    el.querySelector<HTMLButtonElement>('[data-focus-key="learn:recipe_a"]')?.focus();
+    // The disabling repaint IS the new edge: a purse delta reserved away the
+    // focused row's fee.
+    paintInto(el, [
+      row({ recipeId: 'recipe_a', affordable: false }),
+      row({ recipeId: 'recipe_b' }),
+    ]);
+    expect((document.activeElement as HTMLElement).dataset.focusKey).toBe('learn:recipe_b');
+    el.remove();
+  });
+
+  it('walks BACKWARD to the nearer earlier neighbor when the later side is exhausted', () => {
+    // Focus the LAST row, disable it: the forward walk finds nothing past the
+    // ladder end, so the backward rung must catch (deleting the slot - step
+    // arm would drop this to the close button).
+    const el = attachedRoot();
+    const three = [
+      row({ recipeId: 'recipe_a' }),
+      row({ recipeId: 'recipe_b' }),
+      row({ recipeId: 'recipe_c' }),
+    ];
+    paintInto(el, three);
+    el.querySelector<HTMLButtonElement>('[data-focus-key="learn:recipe_c"]')?.focus();
+    paintInto(el, [three[0], three[1], row({ recipeId: 'recipe_c', affordable: false })]);
+    expect((document.activeElement as HTMLElement).dataset.focusKey).toBe('learn:recipe_b');
+    el.remove();
+  });
+
+  it('lands on the nearest surviving row when the ladder came back shorter', () => {
+    // Focus the third row, repaint with two: the exact key is gone and the
+    // remembered slot is out of range, so the slot fallback must land on the
+    // new last row, never skip the ladder for the close button. (The
+    // Math.min clamp itself is outcome-equivalent to the out-of-range walk;
+    // what this decides is that the slot fallback survives a shrink at all.)
+    const el = attachedRoot();
+    paintInto(el, [
+      row({ recipeId: 'recipe_a' }),
+      row({ recipeId: 'recipe_b' }),
+      row({ recipeId: 'recipe_c' }),
+    ]);
+    el.querySelector<HTMLButtonElement>('[data-focus-key="learn:recipe_c"]')?.focus();
+    paintInto(el, [row({ recipeId: 'recipe_a' }), row({ recipeId: 'recipe_b' })]);
+    expect((document.activeElement as HTMLElement).dataset.focusKey).toBe('learn:recipe_b');
+    el.remove();
+  });
+
+  it('falls to the close button when every row came back disabled', () => {
+    const el = attachedRoot();
+    paintInto(el, [row({ recipeId: 'recipe_a' })]);
+    el.querySelector<HTMLButtonElement>('[data-focus-key="learn:recipe_a"]')?.focus();
+    paintInto(el, [row({ recipeId: 'recipe_a', affordable: false })]);
+    expect((document.activeElement as HTMLElement).dataset.focusKey).toBe('close');
+    el.remove();
+  });
+
+  it('never steals focus that was outside the window', () => {
+    const el = attachedRoot();
+    const outside = document.createElement('button');
+    document.body.appendChild(outside);
+    paintInto(el, [row({ recipeId: 'recipe_a' })]);
+    outside.focus();
+    paintInto(el, [row({ recipeId: 'recipe_a' })]);
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+    el.remove();
   });
 });

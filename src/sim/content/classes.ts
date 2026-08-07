@@ -1,3 +1,4 @@
+import { resolveTalentHitMult } from '../talent_hit_mult';
 import {
   type AbilityDef,
   type AbilityEffect,
@@ -88,6 +89,11 @@ export const CLASSES: Record<PlayerClass, ClassDef> = {
       'raging_gale',
       'raised_guard',
       'pummel',
+      // Seething Fury: authored as a plain L10 active (def below) but orphaned
+      // when the v2 talent integration deleted the v1 class-tree grant
+      // (war_berserker_rage) without re-homing it - abilitiesKnownAt could
+      // never return it (owner report: unfindable on a live L20 warrior).
+      'berserker_rage',
       'execute',
       'furious_mending',
       'iron_resolve',
@@ -1351,6 +1357,8 @@ export const ABILITIES: Record<string, AbilityDef> = {
     range: 0,
     school: 'fire',
     requiresTarget: false,
+    requiresOutOfCombat: true,
+    requiresOutsideInstance: true,
     effects: [{ type: 'selfBuff', kind: 'form_fireball', value: 1.4, duration: 3600 }],
     description:
       'Transform into a blazing ember, increasing movement speed by $b%. You cannot attack or cast spells while transformed. Recast to return to your normal form.',
@@ -1802,7 +1810,16 @@ export const ABILITIES: Record<string, AbilityDef> = {
     learnLevel: 5,
     cost: 40,
     castTime: 0,
-    cooldown: 8,
+    // Balance 2026-07-25 (live raid parses + class designer round): the full
+    // three-charge bank STAYS (dumping it inside Phoenix Trance for the free
+    // Pyrelance chain is the fire fantasy, designer call), but each charge
+    // recharges in 30s (was 8s, playtest 2026-07-13). The burst window keeps
+    // its whole payoff; the slow refill is what makes fire fall off after the
+    // window and come back for the next Trance (~110s), so FIGHT-LONG damage
+    // lands at parity: with the Ignite fold fix this measures 1.03x-1.17x the
+    // talented frost comparator at 60s/120s/300s (was 2.2x-2.9x live). Pinned
+    // by tests/fire_short_fight_tuning.test.ts.
+    cooldown: 30,
     range: 20,
     school: 'fire',
     requiresTarget: true,
@@ -1811,7 +1828,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     // Owner rule (round five): fully off the GCD, like Phoenix Trance: castable
     // during one and it never arms one for the other abilities.
     offGcd: true,
-    // Owner playtest 2026-07-13: three stored charges (was two), back to back if banked.
+    // Owner playtest 2026-07-13: three stored charges, back to back if banked.
     maxCharges: 3,
     // Owner playtest round four: no bolt, the embers bite the moment you press.
     projectile: false,
@@ -1935,7 +1952,8 @@ export const ABILITIES: Record<string, AbilityDef> = {
     // Owner rule 2026-07-11: a real cast, EXCEPT under Hot Streak, whose
     // next_cast_instant makes it instant and free (the spender machinery).
     castTime: 2,
-    cooldown: 12,
+    // Owner release rule 2026-07-19: cast time and the GCD pace it, no cooldown.
+    cooldown: 0,
     range: 30,
     school: 'fire',
     requiresTarget: false,
@@ -2060,8 +2078,11 @@ export const ABILITIES: Record<string, AbilityDef> = {
     // The kit's hardest hit flies as the visibly heavier bolt (render-only).
     projectileFx: 'heavyBolt',
     effects: [
-      { type: 'directDamage', min: 170, max: 225 },
-      { type: 'dot', total: 48, duration: 12, interval: 2 },
+      // The first-ten-seed isolated combat sweep put 60s fire below frost.
+      // A 5% Pyrelance lift restores sustained parity while keeping the 27s
+      // burst beneath its 1.6x ceiling and leaving Ignite's contract intact.
+      { type: 'directDamage', min: 179, max: 236 },
+      { type: 'dot', total: 50, duration: 12, interval: 2 },
     ],
     description:
       'Hurls an immense fiery boulder that causes $d Fire damage plus additional damage over time.',
@@ -2285,6 +2306,10 @@ export const ABILITIES: Record<string, AbilityDef> = {
   // ---- Chronomancy out-of-combat mass resurrection. The base seven-second cast
   // and mana cost are provisional playtest values. It has no target and rewinds all
   // dead members on the authoritative group or raid roster at cast completion.
+  // The five-minute cooldown is the real throttle: requiresOutOfCombat alone is not
+  // one, because a backline caster who never draws aggro drops combat mid-fight the
+  // moment combatTimer passes the 5s linger (see the engagedPids pass in sim.ts), so
+  // a zero-cooldown mass rez could be chained repeatedly inside a single encounter.
   collective_reversal: {
     id: 'collective_reversal',
     name: 'Collective Reversal',
@@ -2293,7 +2318,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     specs: ['arcane'],
     cost: 250,
     castTime: 7,
-    cooldown: 0,
+    cooldown: 300,
     range: 0,
     school: 'arcane',
     requiresTarget: false,
@@ -2430,7 +2455,10 @@ export const ABILITIES: Record<string, AbilityDef> = {
     class: 'mage',
     learnLevel: 5,
     specs: ['arcane'],
-    cost: 16,
+    // The integrated level-20 stat curve pushed the conservative rotation to
+    // 65.6s OOM at 16 mana. Fourteen restores the signed 70-80s sustain window
+    // without relaxing the emergency-spam or damage-separation contracts.
+    cost: 14,
     castTime: 2,
     cooldown: 0,
     range: 30,
@@ -2439,7 +2467,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     // Instant impact at cast completion (no traveling bolt): keeps the charge
     // read/write in one deterministic order, see combat/chronomancy.ts.
     projectile: false,
-    // (base cost is `cost: 16` above; DERIVED via the balance harness so the
+    // (base cost is `cost: 14` above; DERIVED via the balance harness so the
     // targets hold WITH the 25% free-cast proc's mana relief.)
     // Low base damage (DERIVED via tests/chronomancy_balance.test.ts): the
     // conservative rotation must sustain clearly under Piro/Cryo (>=35% below);
@@ -2837,7 +2865,16 @@ export const ABILITIES: Record<string, AbilityDef> = {
     school: 'physical',
     requiresTarget: true,
     spendsCombo: true,
-    effects: [{ type: 'dot', total: 96, duration: 16, interval: 2 }],
+    // 16 base + 16/combo point: totals 96 at 5 combo points, same max payoff as
+    // the old flat total, but now scales with combo points banked like every
+    // other finisher in this kit.
+    // Deliberate divergence from classic Rupture, which scales its DURATION
+    // with combo points (8 sec plus 2 sec per point) at a roughly flat per-tick
+    // value. This world's 1 to 20 level band compresses fight lengths, so a
+    // fixed 16 sec window with a combo-scaled tick reads better and keeps the
+    // bleed comparable to the other finishers here. Do not "fix" it back to
+    // duration scaling without retuning the whole rogue bleed budget.
+    effects: [{ type: 'dot', total: 16, duration: 16, interval: 2, perCombo: 16 }],
     description: 'Finishing move that wounds the target, causing it to bleed for $d over 16 sec.',
   },
   vanish: {
@@ -4936,7 +4973,10 @@ export const ABILITIES: Record<string, AbilityDef> = {
     requiresTarget: true,
     spendsCombo: true,
     requiresForm: 'cat',
-    effects: [{ type: 'dot', total: 60, duration: 12, interval: 2 }],
+    // 10 base + 10/combo point: totals 60 at 5 combo points, same max payoff as
+    // the old flat total, but now scales with combo points banked like every
+    // other finisher in this kit.
+    effects: [{ type: 'dot', total: 10, duration: 12, interval: 2, perCombo: 10 }],
     description:
       'Finishing move that causes $d Bleed damage over 12 sec. Consumes combo points. Wolf Form only.',
   },
@@ -5385,6 +5425,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     effects: [
       { type: 'directDamage', min: 90, max: 110 },
       { type: 'chainDamage', min: 60, max: 75, jumps: 2, falloff: 1, radius: 10 },
+      { type: 'selfBuff', kind: 'buff_armor', value: 150, duration: 10 },
     ],
     description:
       'Hurls a radiant aegis at an enemy for 90 to 110 Holy damage, then bounces to 2 nearby enemies for 60 to 75 Holy damage each. (Protection signature)',
@@ -5479,7 +5520,7 @@ export const ABILITIES: Record<string, AbilityDef> = {
     // same day: the Phoenix Trance window is meant to chain free Pyroblasts).
     effects: [{ type: 'selfBuff', kind: 'combustion', value: 0, duration: 10 }],
     description:
-      'Combust: for 10 sec your Fire spells always critically strike, including bolts already in flight. Off the global cooldown. These crits build Hot Streak like any other. (Fire signature)',
+      'Combust: for 10 sec your Fire spells always critically strike, including bolts already in flight. Off the global cooldown. These crits build Hot Streak like any other, and casting it finishes the Cinderfall charge currently recharging. (Fire signature)',
   },
   cone_of_cold: {
     id: 'cone_of_cold',
@@ -5935,13 +5976,19 @@ export const ABILITIES: Record<string, AbilityDef> = {
     range: 0,
     school: 'arcane',
     requiresTarget: false,
-    // One dispatch applies the vanish, the damage cut (duration + linger so it
-    // survives an early break), and strips up to two DoTs (effect_dispatch).
+    // One dispatch strips up to two DoTs and applies the vanish. Its configured
+    // damage cut starts only once that vanish ends (effect_dispatch).
     effects: [
-      { type: 'greaterInvisibility', duration: 20, drValue: 0.9, linger: 3, removeDotCount: 2 },
+      {
+        type: 'greaterInvisibility',
+        duration: 20,
+        drValue: 0.9,
+        afterDuration: 2,
+        removeDotCount: 2,
+      },
     ],
     description:
-      'Vanish for 20 sec: removes 2 damage-over-time effects and you take 90% less damage while invisible and shortly after. (Mage talent)',
+      'Vanish for 20 sec and remove 2 damage-over-time effects. When the invisibility ends, take 90% less damage for 2 sec. (Mage talent)',
   },
   rings_of_frost: {
     id: 'rings_of_frost',
@@ -6309,13 +6356,24 @@ function scaleEffect(
       // fraction again would double-apply the talent/global damage modifier.
       return eff.directPct
         ? { ...eff }
-        : { ...eff, total: Math.round(eff.total * dmgMult * dotMult + flat) };
+        : {
+            ...eff,
+            total: Math.round(eff.total * dmgMult * dotMult + flat),
+            perCombo:
+              eff.perCombo === undefined ? undefined : Math.round(eff.perCombo * dmgMult * dotMult),
+          };
     case 'aoeDamage':
     case 'aoeHeal':
       return {
         ...eff,
         min: Math.round(eff.min * (eff.type === 'aoeHeal' ? healMult : dmgMult) + flat),
         max: Math.round(eff.max * (eff.type === 'aoeHeal' ? healMult : dmgMult) + flat),
+      };
+    case 'chainDamage':
+      return {
+        ...eff,
+        min: Math.round(eff.min * dmgMult + flat),
+        max: Math.round(eff.max * dmgMult + flat),
       };
     case 'aoeRoot':
       return { ...eff, min: Math.round(eff.min * dmgMult), max: Math.round(eff.max * dmgMult) };
@@ -6353,6 +6411,17 @@ function scaleEffect(
         ...eff,
         min: Math.round(eff.min * healMult + flat),
         max: Math.round(eff.max * healMult + flat),
+      };
+    case 'massTemporalEcho':
+      // Like heal/chainHeal, the initial-heal base is talent scaled here so it
+      // matches the SP rider talentHealMult now applies at the effect_dispatch.ts
+      // call site (Chronoweave's "all healing" bonus was previously a no-op here).
+      return {
+        ...eff,
+        heal: {
+          min: Math.round(eff.heal.min * healMult + flat),
+          max: Math.round(eff.heal.max * healMult + flat),
+        },
       };
     case 'hot':
       return { ...eff, total: Math.round(eff.total * healMult * hotMult + flat) };
@@ -6393,6 +6462,30 @@ function scaleEffect(
       return { ...eff, mana: Math.round(eff.mana * dmgMult + flat) };
     case 'gainResource':
       return { ...eff, amount: Math.round(eff.amount * dmgMult + flat) };
+    case 'groundAoE':
+      // Rune of Power's pulse is an ally damage-done buff, not a damage roll
+      // (its authored min/max are 0/0): leave it untouched so a flat talent
+      // mod can never turn a buff zone into a damage zone.
+      return eff.allyBuffPct
+        ? eff
+        : {
+            ...eff,
+            min: Math.round(eff.min * dmgMult + flat),
+            max: Math.round(eff.max * dmgMult + flat),
+          };
+    case 'repositionToAim':
+      // Heroic Leap's landing hit is a groundAoE-shaped rider on the
+      // reposition; scale it the same way a groundAoE pulse scales.
+      return eff.landingAoe
+        ? {
+            ...eff,
+            landingAoe: {
+              ...eff.landingAoe,
+              min: Math.round(eff.landingAoe.min * dmgMult + flat),
+              max: Math.round(eff.landingAoe.max * dmgMult + flat),
+            },
+          }
+        : eff;
     default:
       return eff;
   }
@@ -6403,10 +6496,15 @@ function scaleEffect(
 // mods stack on top and also tune cost / cast time / cooldown.
 function applyTalentMods(entry: KnownAbility, mods: TalentModifiers): void {
   const am = mods.abilities[entry.def.id];
-  const physical = entry.def.school === 'physical';
-  const globalDmg = physical ? mods.global.meleeDmgPct : mods.global.spellDmgPct;
-  const dmgMult = 1 + globalDmg + (am?.dmgPct ?? 0);
-  const healMult = 1 + mods.global.healPct + (am?.dmgPct ?? 0);
+  // dmgMult/healMult come from the shared talent_hit_mult resolver: the SAME
+  // function combat sites (effect_dispatch.ts/casting_lifecycle.ts/auto_attack.ts)
+  // call to scale a resolved ability's runtime SP/AP/weapon rider, so the
+  // authored-base bake here and the rider scaling at combat time can never drift
+  // apart. (The melee bucket also covers hunter's ranged-AP shots regardless of
+  // magic school: `scalesWith: 'ranged'` is exclusively set on hunter abilities
+  // (arcane_shot, serpent_sting, wyvern_sting are non-physical), so Marksmanship's
+  // Iron Aim ("ranged ability damage") reaches Arcane Shot, the spec's arcane nuke.)
+  const { dmgMult, healMult } = resolveTalentHitMult(entry.def, mods);
   const dotMult = 1 + mods.global.dotDmgPct;
   const hotMult = 1 + mods.global.hotHealPct;
   const absorbMult = 1 + mods.global.absorbPct;

@@ -9,13 +9,13 @@
     "augment wave: fiestaPickOffers + arenaAugmentPick (fiestaAugments on meta + augmentOffer/Chosen events)",
     "multi-player meta"
   ],
-  "draws": 606,
-  "drawDigest": "509fee2b",
+  "draws": 1176,
+  "drawDigest": "1ab1c3cb",
   "frames": [
     {
       "tick": 0,
       "time": 0,
-      "nextId": 415,
+      "nextId": 963,
       "state": "5bc471b0",
       "events": "741638a5",
       "rng": {
@@ -29,9 +29,9 @@
     {
       "tick": 25,
       "time": 1.25,
-      "nextId": 419,
-      "state": "54eff241",
-      "events": "5560e865",
+      "nextId": 967,
+      "state": "18feeb15",
+      "events": "6a2f178b",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -40,67 +40,67 @@
     {
       "tick": 50,
       "time": 2.5,
-      "nextId": 419,
-      "state": "ae282d00",
-      "events": "2624f545",
+      "nextId": 967,
+      "state": "62cb6bec",
+      "events": "224cbfd9",
       "rng": {
-        "draws": 36,
-        "digest": "dbad5b7f"
+        "draws": 66,
+        "digest": "383a5306"
       }
     },
     {
       "tick": 75,
       "time": 3.75,
-      "nextId": 419,
-      "state": "3f7fa57a",
-      "events": "92dd922d",
+      "nextId": 967,
+      "state": "def24ac2",
+      "events": "969ec561",
       "rng": {
-        "draws": 120,
-        "digest": "3ac728b9"
+        "draws": 247,
+        "digest": "6b3f31b5"
       }
     },
     {
       "tick": 100,
       "time": 5,
-      "nextId": 419,
-      "state": "a21d9609",
-      "events": "547fbe65",
+      "nextId": 967,
+      "state": "186085ad",
+      "events": "507341c9",
       "rng": {
-        "draws": 231,
-        "digest": "e2ff5500"
+        "draws": 485,
+        "digest": "b0986e30"
       }
     },
     {
       "tick": 125,
       "time": 6.25,
-      "nextId": 419,
-      "state": "edddcede",
-      "events": "b5a4d523",
+      "nextId": 967,
+      "state": "1de455b2",
+      "events": "ada54ef3",
       "rng": {
-        "draws": 385,
-        "digest": "e8022e47"
+        "draws": 755,
+        "digest": "c2a9f447"
       }
     },
     {
       "tick": 150,
       "time": 7.5,
-      "nextId": 419,
-      "state": "c1ace3c1",
+      "nextId": 967,
+      "state": "2b5b2011",
       "events": "741638a5",
       "rng": {
-        "draws": 537,
-        "digest": "e6907c7a"
+        "draws": 1038,
+        "digest": "bee5a5dc"
       }
     },
     {
       "tick": 163,
       "time": 8.15,
-      "nextId": 419,
-      "state": "bf27751a",
-      "events": "ec02393c",
+      "nextId": 967,
+      "state": "c533fd2a",
+      "events": "8945b220",
       "rng": {
-        "draws": 606,
-        "digest": "509fee2b"
+        "draws": 1176,
+        "digest": "1ab1c3cb"
       },
       "label": "final",
       "players": [
@@ -116,13 +116,13 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {
             "kills": 1
           },
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {
               "damageDealt": 510
@@ -137,7 +137,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -188,11 +188,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -205,7 +205,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -257,13 +257,13 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "rogue",
           "companionUpgrades": {},
           "counters": {
             "deaths": 1
           },
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -275,7 +275,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 417,
+          "entityId": 965,
           "equipment": {
             "chest": "footpad_jerkin",
             "mainhand": "rusty_dagger",
@@ -327,11 +327,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "hunter",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -344,7 +344,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 418,
+          "entityId": 966,
           "equipment": {
             "chest": "footpad_jerkin",
             "mainhand": "rusty_hatchet"
@@ -397,7 +397,7 @@
               "name": "Battle Stance",
               "remaining": 3591.9,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -409,7 +409,7 @@
           "dodgeChance": 0.0695,
           "fiveSecondRule": 107.15,
           "hp": 822,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 20,
           "lootFfaTimer": "Infinity",
@@ -421,8 +421,8 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 4193,
-            "z": -1264
+            "x": 103593,
+            "z": -1268
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -457,7 +457,7 @@
           "dodgeChance": 0.056,
           "fiveSecondRule": 107.15,
           "hp": 418,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 20,
           "lootFfaTimer": "Infinity",
@@ -468,8 +468,8 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 4207,
-            "z": -1264
+            "x": 103607,
+            "z": -1268
           },
           "potionCooldownUntil": -1,
           "resource": 1581,
@@ -507,7 +507,7 @@
           "facing": 3.141593,
           "fiveSecondRule": 107.15,
           "hp": 510,
-          "id": 417,
+          "id": 965,
           "kind": "player",
           "level": 20,
           "lootFfaTimer": "Infinity",
@@ -525,8 +525,8 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 4193,
-            "z": -1232
+            "x": 103593,
+            "z": -1228
           },
           "potionCooldownUntil": -1,
           "resource": 100,
@@ -564,7 +564,7 @@
           "facing": 3.141593,
           "fiveSecondRule": 107.15,
           "hp": 783,
-          "id": 418,
+          "id": 966,
           "kind": "player",
           "level": 20,
           "lootFfaTimer": "Infinity",
@@ -575,8 +575,8 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 4207,
-            "z": -1232
+            "x": 103607,
+            "z": -1228
           },
           "potionCooldownUntil": -1,
           "rangedPower": 188,

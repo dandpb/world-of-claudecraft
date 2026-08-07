@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { MOBS } from '../src/sim/data';
+import { BUILTIN_WORLD, MOBS } from '../src/sim/data';
+import { EASTBROOK_BUILDINGS_BY_ID, localToWorld } from '../src/sim/eastbrook_layout';
 import { respawnMob } from '../src/sim/mob/lifecycle';
 import { resetEvadingMob } from '../src/sim/mob/locomotion';
 import { combatProfileForMob, scaledDefaultMobMeleeRange } from '../src/sim/mob_combat';
 import { Sim } from '../src/sim/sim';
-import type { Entity, SimEvent } from '../src/sim/types';
+import type { Entity, SimEvent, WorldContent } from '../src/sim/types';
 import {
   isWorldBossLootEligible,
   markWorldBossLooted,
@@ -17,6 +18,16 @@ import {
 const BOSS_ID = 'thunzharr_waking_peak';
 const DAY = '2026-06-28';
 
+// World bosses are scheduler-spawned and do not depend on ambient camps/NPCs.
+// Keeping those entities out makes the 40-seed personal-loot property measure
+// loot behavior rather than repeatedly constructing the whole continent.
+const WORLD_BOSS_TEST_WORLD: WorldContent = {
+  ...BUILTIN_WORLD,
+  camps: [],
+  npcs: {},
+  groundObjects: [],
+};
+
 // Minimal PlayerMeta stand-in for the pure lockout-gate helpers (they touch only
 // .raidLockouts). Cast through unknown to satisfy the full PlayerMeta type.
 function fakeMeta() {
@@ -26,7 +37,13 @@ function fakeMeta() {
 }
 
 function makeSim(seed = 7) {
-  return new Sim({ seed, playerClass: 'warrior', autoEquip: true, noPlayer: true });
+  return new Sim({
+    seed,
+    playerClass: 'warrior',
+    autoEquip: true,
+    noPlayer: true,
+    world: WORLD_BOSS_TEST_WORLD,
+  });
 }
 
 function findBoss(sim: Sim): Entity | undefined {
@@ -368,16 +385,18 @@ describe('world boss personal loot', () => {
 
   it('caps gear at one Tier-2 piece per contributor (never a glove AND a belt in one kill)', () => {
     let anyGearDropped = false;
-    // Sweep many seeds/contributors: the invariant (<= 1 gear each) must hold on every
-    // roll, and across the sweep gear must actually drop (so the cap is not vacuous).
-    for (let seed = 1; seed <= 40; seed++) {
-      const sim = makeSim(seed);
-      sim.utcDay = DAY;
-      const pids = [
-        sim.addPlayer('warrior', 'Ada'),
-        sim.addPlayer('mage', 'Bru'),
-        sim.addPlayer('rogue', 'Cyd'),
-      ];
+    const sim = makeSim(1);
+    sim.utcDay = DAY;
+    const pids = [
+      sim.addPlayer('warrior', 'Ada'),
+      sim.addPlayer('mage', 'Bru'),
+      sim.addPlayer('rogue', 'Cyd'),
+    ];
+    // Forty consecutive bosses exercise 120 deterministic personal loot rolls.
+    // A fresh continent per roll does not affect loot and used to dominate the
+    // property runtime, so reuse the same authoritative Sim and advance its RNG.
+    for (let roll = 1; roll <= 40; roll++) {
+      (sim as any).worldBossEntityIds[0] = null;
       const { boss } = spawnBossNow(sim);
       killWith(sim, boss, pids);
       const items = boss.loot?.items ?? [];
@@ -390,6 +409,7 @@ describe('world boss personal loot', () => {
         expect(gear.length).toBeLessThanOrEqual(1);
         if (gear.length === 1) anyGearDropped = true;
       }
+      (sim as any).dropEntity(boss.id);
     }
     expect(anyGearDropped).toBe(true);
   });
@@ -819,17 +839,24 @@ describe('world boss pathing (phases through obstacles)', () => {
   it('walks a dead-straight chase line through a building collider', () => {
     const sim = makeSim();
     const { boss } = spawnBossNow(sim);
-    // The zone1 house at (10, 12) is a 7x6 OBB collider. Park the boss south of
-    // it and march him due north straight through: with phasesThroughObstacles
-    // his x never deviates and he arrives on the straight-line tick budget. A
-    // sliding mover would have to fan around the OBB (x deviates) or stall.
-    boss.pos = { x: 10, z: 2, y: 0 };
-    const dest = { x: 10, z: 22, y: 0 };
+    const bank = EASTBROOK_BUILDINGS_BY_ID.eastbrook_bank;
+    const start = localToWorld(
+      bank.position,
+      bank.rotation,
+      0,
+      bank.nativeDimensions.depth / 2 + 5,
+    );
+    const end = localToWorld(bank.position, bank.rotation, 0, -bank.nativeDimensions.depth / 2 - 5);
+    boss.pos = { ...start, y: 0 };
+    const dest = { ...end, y: 0 };
     let arrived = false;
-    const straightTicks = Math.ceil(20 / (boss.moveSpeed * (1 / 20))) + 2;
+    const lineLength = Math.hypot(end.x - start.x, end.z - start.z);
+    const straightTicks = Math.ceil(lineLength / (boss.moveSpeed * (1 / 20))) + 2;
     for (let t = 0; t < straightTicks && !arrived; t++) {
       arrived = (sim as any).moveToward(boss, dest, boss.moveSpeed);
-      expect(Math.abs(boss.pos.x - 10)).toBeLessThan(1e-6);
+      const cross =
+        (boss.pos.x - start.x) * (end.z - start.z) - (boss.pos.z - start.z) * (end.x - start.x);
+      expect(Math.abs(cross) / lineLength).toBeLessThan(1e-6);
     }
     expect(arrived).toBe(true);
   });
@@ -839,10 +866,25 @@ describe('world boss pathing (phases through obstacles)', () => {
     const { boss } = spawnBossNow(sim);
     // Reuse the boss entity but masquerade as an unflagged template: the gate
     // reads MOBS[templateId], so a plain wolf template must NOT phase.
+    const bank = EASTBROOK_BUILDINGS_BY_ID.eastbrook_bank;
+    const start = localToWorld(
+      bank.position,
+      bank.rotation,
+      0,
+      bank.nativeDimensions.depth / 2 + 0.7,
+    );
+    const end = localToWorld(bank.position, bank.rotation, 0, -bank.nativeDimensions.depth / 2 - 5);
     boss.templateId = 'forest_wolf';
-    boss.pos = { x: 10, z: 8, y: 0 };
-    (sim as any).moveToward(boss, { x: 10, z: 22, y: 0 }, 7);
-    const deflected = Math.abs(boss.pos.x - 10) > 1e-6 || Math.abs(boss.pos.z - 8) < 0.3;
+    boss.pos = { ...start, y: 0 };
+    (sim as any).moveToward(boss, { ...end, y: 0 }, 7);
+    const lineLength = Math.hypot(end.x - start.x, end.z - start.z);
+    const progress =
+      ((boss.pos.x - start.x) * (end.x - start.x) + (boss.pos.z - start.z) * (end.z - start.z)) /
+      lineLength;
+    const cross =
+      ((boss.pos.x - start.x) * (end.z - start.z) - (boss.pos.z - start.z) * (end.x - start.x)) /
+      lineLength;
+    const deflected = Math.abs(cross) > 1e-6 || progress < 0.3;
     expect(deflected).toBe(true);
   });
 

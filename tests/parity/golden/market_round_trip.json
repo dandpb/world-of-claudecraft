@@ -17,7 +17,7 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 415,
+      "nextId": 963,
       "state": "5bc471b0",
       "events": "741638a5",
       "rng": {
@@ -31,9 +31,9 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "9fb08a19",
-      "events": "97d31870",
+      "nextId": 965,
+      "state": "5a0b6a57",
+      "events": "c85885ae",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -52,11 +52,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -70,7 +70,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -109,12 +109,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 5000,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -127,7 +127,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -166,7 +166,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -179,7 +179,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -191,9 +191,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -229,7 +229,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -240,9 +240,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -273,9 +273,9 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "26552c63",
-      "events": "a4cdf07e",
+      "nextId": 965,
+      "state": "33e999d9",
+      "events": "17ee87a4",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -294,11 +294,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -312,7 +312,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -351,12 +351,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 5000,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -369,7 +369,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -408,7 +408,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -421,7 +421,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -433,9 +433,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -471,7 +471,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -482,9 +482,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -515,8 +515,8 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "26552c63",
+      "nextId": 965,
+      "state": "33e999d9",
       "events": "741638a5",
       "rng": {
         "draws": 0,
@@ -536,11 +536,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -554,7 +554,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -593,12 +593,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 5000,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -611,7 +611,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -650,7 +650,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -663,7 +663,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -675,9 +675,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -713,7 +713,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -724,9 +724,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -757,8 +757,8 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "26552c63",
+      "nextId": 965,
+      "state": "33e999d9",
       "events": "741638a5",
       "rng": {
         "draws": 0,
@@ -778,11 +778,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -796,7 +796,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -835,12 +835,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 5000,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -853,7 +853,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -892,7 +892,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -905,7 +905,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -917,9 +917,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -955,7 +955,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -966,9 +966,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -999,9 +999,9 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "17a57d60",
-      "events": "79f63f71",
+      "nextId": 965,
+      "state": "5ff49a4e",
+      "events": "ac8345cb",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -1020,11 +1020,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1038,7 +1038,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -1077,12 +1077,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 4700,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1096,7 +1096,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -1139,7 +1139,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -1152,7 +1152,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1164,9 +1164,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -1202,7 +1202,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1213,9 +1213,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -1246,9 +1246,9 @@
     {
       "tick": 0,
       "time": 0,
-      "nextId": 417,
-      "state": "17a57d60",
-      "events": "d0eddab9",
+      "nextId": 965,
+      "state": "5ff49a4e",
+      "events": "5c87dfeb",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -1267,11 +1267,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1285,7 +1285,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -1324,12 +1324,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 4700,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1343,7 +1343,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -1386,7 +1386,7 @@
               "name": "Battle Stance",
               "remaining": 3600,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -1399,7 +1399,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1411,9 +1411,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -1449,7 +1449,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 99,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1460,9 +1460,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -1493,9 +1493,9 @@
     {
       "tick": 20,
       "time": 1,
-      "nextId": 417,
-      "state": "27f923e8",
-      "events": "d06d1463",
+      "nextId": 965,
+      "state": "f8aaa7ba",
+      "events": "1fc26b9f",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -1504,8 +1504,8 @@
     {
       "tick": 20,
       "time": 1,
-      "nextId": 417,
-      "state": "27f923e8",
+      "nextId": 965,
+      "state": "f8aaa7ba",
       "events": "741638a5",
       "rng": {
         "draws": 0,
@@ -1525,11 +1525,11 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1546,7 +1546,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -1585,12 +1585,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 4700,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1607,7 +1607,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -1650,7 +1650,7 @@
               "name": "Battle Stance",
               "remaining": 3599,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -1663,7 +1663,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1675,9 +1675,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -1713,7 +1713,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1724,9 +1724,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -1757,9 +1757,9 @@
     {
       "tick": 20,
       "time": 1,
-      "nextId": 417,
-      "state": "02b500dc",
-      "events": "57d8eaa7",
+      "nextId": 965,
+      "state": "d181a7a2",
+      "events": "b6165e7f",
       "rng": {
         "draws": 0,
         "digest": "811c9dc5"
@@ -1778,12 +1778,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "copper": 285,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {
               "marketSaleCopper": 285
@@ -1802,7 +1802,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -1841,12 +1841,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 4700,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -1863,7 +1863,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -1906,7 +1906,7 @@
               "name": "Battle Stance",
               "remaining": 3599,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -1919,7 +1919,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1931,9 +1931,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -1969,7 +1969,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -1980,9 +1980,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,
@@ -2013,8 +2013,8 @@
     {
       "tick": 20,
       "time": 1,
-      "nextId": 417,
-      "state": "02b500dc",
+      "nextId": 965,
+      "state": "d181a7a2",
       "events": "741638a5",
       "rng": {
         "draws": 0,
@@ -2034,12 +2034,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "warrior",
           "companionUpgrades": {},
           "copper": 285,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {
               "marketSaleCopper": 285
@@ -2058,7 +2058,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 415,
+          "entityId": 963,
           "equipment": {
             "chest": "recruit_tunic",
             "mainhand": "worn_sword",
@@ -2097,12 +2097,12 @@
             null
           ],
           "bank": {},
+          "bgRating": 1500,
           "cls": "mage",
           "companionUpgrades": {},
           "copper": 4700,
           "counters": {},
           "craftSkills": {},
-          "craftThrottle": {},
           "deedStats": {
             "counters": {},
             "dungeonClears": {},
@@ -2119,7 +2119,7 @@
           },
           "delveClears": {},
           "delveDaily": {},
-          "entityId": 416,
+          "entityId": 964,
           "equipment": {
             "chest": "apprentice_robe",
             "mainhand": "gnarled_staff"
@@ -2162,7 +2162,7 @@
               "name": "Battle Stance",
               "remaining": 3599,
               "school": "physical",
-              "sourceId": 415
+              "sourceId": 963
             }
           ],
           "blockChance": 0.05,
@@ -2175,7 +2175,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 100,
-          "id": 415,
+          "id": 963,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -2187,9 +2187,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resourceType": "rage",
@@ -2225,7 +2225,7 @@
           "fallStartY": 1.5,
           "fiveSecondRule": 100,
           "hp": 54,
-          "id": 416,
+          "id": 964,
           "kind": "player",
           "level": 1,
           "lootFfaTimer": "Infinity",
@@ -2236,9 +2236,9 @@
           "overpowerUntil": -1,
           "petMode": "defensive",
           "pos": {
-            "x": 1.337475,
+            "x": -4.376409,
             "y": 1.5,
-            "z": 8.040014
+            "z": 7.96783
           },
           "potionCooldownUntil": -1,
           "resource": 195,

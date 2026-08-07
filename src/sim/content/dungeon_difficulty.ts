@@ -66,25 +66,61 @@ export interface HeroicDungeonTuning {
 // Unlike the heroic table this one is PER MOB, because the floor-style targets
 // below need different factors for trash, non-elite adds (no 1.5x elite swing
 // multiplier), and bosses. The per-mob factor also drives mechanicDamageMult,
-// so a boss's aoePulse/stomp scale with its own melee (../instances/difficulty.ts).
+// so a boss's aoePulse/stomp scale with its own melee (../instances/difficulty.ts),
+// UNLESS the mob has a mechanicDamageMultiplierByMob override: that decouples an
+// AVOIDABLE telegraphed mechanic from the unavoidable tank-swing calibration, so
+// a skill check can stay lethal while melee intake is priced for the fresh tank.
 export interface NormalDungeonTuning {
   id: string;
   difficulty: Extract<DungeonDifficulty, 'normal'>;
   healthMultiplier: number;
   damageMultiplierByMob: Record<string, number>;
+  // Optional per-mob override for mechanicDamageMult only (aoePulse, stomp,
+  // infernoChannel); a mob absent here falls back to its damageMultiplierByMob
+  // factor. Keys must be a subset of damageMultiplierByMob (pinned by
+  // tests/gravewyrm_normal_tuning.test.ts).
+  mechanicDamageMultiplierByMob?: Record<string, number>;
+  // Optional per-mob multiplier for a mob's RANGED petSpell nuke. Needed
+  // because damageMultiplierByMob moves dmgBase/dmgPerLevel, which is MELEE
+  // only, while a petSpell caster stands at spell range and casts instead of
+  // swinging (mob/combat_profile.ts updateCasterCombat: "the chase-arm melee
+  // probes are dead in practice"). For such a mob the melee factor is inert and
+  // this is the factor that actually prices it. Rolled damage is unmitigated by
+  // armor, so its floor is measured on the raw hit, not the tank's intake.
+  // Keys must be a subset of damageMultiplierByMob, and every key must name a
+  // template that actually HAS a petSpell (pinned by
+  // tests/wildheart_normal_tuning.test.ts).
+  rangedDamageMultiplierByMob?: Record<string, number>;
 }
 
-// Economy retune (v0.29): soloable normal Sanctum runs were printing up to 6
-// gold per clear. Calibration target: every mob's health DOUBLES, and the
-// minimum non-crit swing lands at least 300 (trash) / 600 (bosses) on the
-// maximum-mitigation reference warrior: level-20 prot in the max-armor kit
-// (full heroic plate + shield, prot mastery), 2861 armor, in Defensive Stance
-// (takes 10% less), i.e. only ~37-38% of a raw swing gets through. Solving the
-// floor per mob at its minimum spawn level gives the ladder below; the
-// non-elite raised_bonewalker needs roughly double the trash factor because it
-// lacks the 1.5x elite swing multiplier. Pinned by
-// tests/gravewyrm_normal_tuning.test.ts, which also pins the heroic transform
-// literals so a base-template edit cannot slip through unnoticed.
+// Fresh-group retune (v0.30), pressure pass (2026-07-26): the first v0.30
+// calibration (trash 90 / bosses 200 / adds 50 floors) fixed the unclearable
+// v0.29 economy floors, but overshot soft: a fresh THREE-player group cleared
+// the dungeon without pressure, because its Monte Carlo bench modeled the
+// worst-case healer (autopilot, no cooldowns) and priced the floors so that
+// worst case barely survived. This pass raises the minimum non-crit swing on
+// the reference warrior (level-20 prot in the max-armor kit, 2861 armor,
+// Defensive Stance) to at least 100 (trash, lands 103+) and 200 (bosses:
+// Korgath 301 / Korzul 280, ~29-31% of a fresh tank pool per average swing;
+// Velkhar is UNCHANGED at the 200 line, ~21%, because he was already the
+// peak fight: he swings at 2.0s and layers his summon waves on top for a
+// ~305 dtps wave-window peak), with the summoned bonewalkers still at 50
+// (wave pressure, not extra bosses). Korgath and Korzul rise to MEET
+// Velkhar: boss dtps on a fresh tank now runs ~179-193, pressed above a
+// fresh healer's sustain so the tank loses ground without cooldowns; tanks
+// are crit-immune since v0.29.1, so no swing can spike past the 1.25x roll
+// cap (~38% of pool). Korzul's melee sits below Korgath's per-multiplier
+// because he also carries the guaranteed inferno channel (the 50% hp gate)
+// on top of his 30% enrage.
+// Korzul additionally carries a mechanicDamageMultiplierByMob override: his
+// Grave Inferno channel is fully avoidable (rooted boss, no melee during it,
+// true-radius telegraph), so it prices at 15x, lethal to a ~1000hp fresh
+// melee pool that stands all four pulses (1050-1350 raw) while pulse one
+// stays a scratch; his melee stays on the tank calibration above. The
+// DOUBLED health stays: the economy lever is clear time, not lethality.
+// Pinned by tests/gravewyrm_normal_tuning.test.ts, which also pins the
+// heroic transform literals so a base-template edit cannot slip through
+// unnoticed.
 //
 // Normal Nythraxis gets the same treatment (2x health, boss floor 600,
 // skeleton waves floor 300, both landing at their level-20 spawns): the boss
@@ -97,12 +133,15 @@ export const NORMAL_DUNGEON_TUNING: Record<string, NormalDungeonTuning> = {
     difficulty: 'normal',
     healthMultiplier: 2.0,
     damageMultiplierByMob: {
-      sanctum_boneguard: 7.5,
-      sanctum_drakonid: 7.25,
-      raised_bonewalker: 11.25,
-      korgath_the_bound: 13.5,
-      grand_necromancer_velkhar: 14,
-      korzul_the_gravewyrm: 13,
+      sanctum_boneguard: 3.8,
+      sanctum_drakonid: 3.7,
+      raised_bonewalker: 3.75,
+      korgath_the_bound: 9.5,
+      grand_necromancer_velkhar: 6.6,
+      korzul_the_gravewyrm: 8.5,
+    },
+    mechanicDamageMultiplierByMob: {
+      korzul_the_gravewyrm: 15,
     },
   },
   nythraxis_boss_arena: {
@@ -114,6 +153,54 @@ export const NORMAL_DUNGEON_TUNING: Record<string, NormalDungeonTuning> = {
       nythraxis_skeleton_warrior: 5,
     },
   },
+  // Wildheart Basin shipped with a heroic record but NO normal one, so its
+  // normal mode ran the raw base templates: trash swung 26-32 post-mitigation
+  // on the reference warrior and Zulgar 35, against the Sanctum's 103-112 and
+  // 200-301. That is 3.5x under on trash and 6-8x under on the boss, for a
+  // dungeon whose loot and level sit in the same endgame band. This record puts
+  // normal Wildheart on the SANCTUM NORMAL calibration: the same DOUBLED health
+  // and the same reference warrior (level-20 prot, 2861 armor, Defensive
+  // Stance), floored per band at trash 100 / boss 200.
+  //
+  // Two Wildheart-specific departures from the Sanctum table, both forced by
+  // the roster rather than chosen:
+  // 1. A third band at 150 for wildheart_beastmaster. It is a rare, ccImmune
+  //    pack-leader that spawns TWICE and carries warcry + wardAllies + stomp,
+  //    so it out-presses trash, but it is not the final boss and must not read
+  //    as a third Zulgar. Nythraxis set the same precedent (its own 600/300
+  //    bands rather than the five-man 500/250).
+  // 2. rangedDamageMultiplierByMob for the two petSpell casters. HALF the
+  //    20-spawn roster (stalker x6, hexcaller x4) is a ranged caster that never
+  //    melees, so its damageMultiplierByMob factor is inert and its real output
+  //    is a petSpell nuke no other knob reaches. Priced to the same 100 minimum
+  //    hit as trash melee: unmitigated by armor and landable on any group
+  //    member, which is what makes them the priority kill the content brief
+  //    calls for. Their melee factors are still solved to the 100 floor so a
+  //    caster cornered in melee range (the chase arm) is on-model too.
+  //
+  // Mechanics ride each mob's own melee factor with NO override, which is the
+  // Sanctum default: Zulgar's Wildheart Pulse lands 170-243 raw every 9s
+  // against Korgath's Shuddering Stomp at 190-285 every 12s, and the
+  // beastmaster's Beast Pit Quake 88-130. Support scales on mechanicHealMult
+  // (= healthMultiplier), so the hexcaller's Ancestral Sap heals 72-100 and
+  // Thickhide Ward absorbs 140, both keeping pace with the doubled pools.
+  // Pinned by tests/wildheart_normal_tuning.test.ts.
+  wildheart_basin: {
+    id: 'wildheart_basin',
+    difficulty: 'normal',
+    healthMultiplier: 2.0,
+    damageMultiplierByMob: {
+      wildheart_stalker: 3.7,
+      wildheart_ravager: 3.15,
+      wildheart_hexcaller: 3.9,
+      wildheart_beastmaster: 4.2,
+      wildheart_high_priest: 5.65,
+    },
+    rangedDamageMultiplierByMob: {
+      wildheart_stalker: 2.7,
+      wildheart_hexcaller: 2.5,
+    },
+  },
 };
 
 export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
@@ -123,8 +210,9 @@ export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
     level: 22,
     healthMultiplier: 3.8,
     damageMultiplier: 20,
-    // No hollow_crypt boss summons adds; kept at the half convention, inert.
-    addDamageMultiplier: 10,
+    // No hollow_crypt boss summons adds; inert, but rides the v0.30 40% add
+    // nerf with the other heroics so a future summoner starts on-model.
+    addDamageMultiplier: 6,
     armorMultiplier: 1.3,
     finalBossId: 'morthen',
     marksPerParticipant: 1,
@@ -135,9 +223,11 @@ export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
     level: 22,
     healthMultiplier: 4.0,
     damageMultiplier: 18,
-    // Vael's drowned_thrall summons are non-elite: 16.25x lands the summoned
-    // 250 floor (adds are wave pressure, not extra bosses; 2026-07 retune).
-    addDamageMultiplier: 16.25,
+    // Vael's drowned_thrall summons are non-elite. v0.30: boss-summoned adds
+    // hit 40% softer across every heroic five-man (the 250 floor drops to
+    // 150); a tanked triple wave stacked on the boss was still overwhelming
+    // healers after the 2026-07 retune.
+    addDamageMultiplier: 9.75,
     armorMultiplier: 1.3,
     finalBossId: 'vael_the_mistcaller',
     marksPerParticipant: 1,
@@ -148,9 +238,9 @@ export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
     level: 22,
     healthMultiplier: 5.2,
     damageMultiplier: 16.5,
-    // Ysolei's moonspawn summons are non-elite: 15.25x lands the summoned
-    // 250 floor (2026-07 retune).
-    addDamageMultiplier: 15.25,
+    // Ysolei's moonspawn summons are non-elite; 40% add nerf (v0.30), the
+    // summoned floor drops from 250 to 150.
+    addDamageMultiplier: 9.15,
     armorMultiplier: 1.25,
     finalBossId: 'ysolei',
     marksPerParticipant: 1,
@@ -161,12 +251,12 @@ export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
     level: 22,
     healthMultiplier: 4.0,
     damageMultiplier: 15.5,
-    // Velkhar's raised_bonewalker summons are non-elite: 14.25x lands the
-    // summoned 250 floor (2026-07 retune).
-    addDamageMultiplier: 14.25,
+    // Velkhar's raised_bonewalker summons are non-elite; 40% add nerf
+    // (v0.30), the summoned floor drops from 250 to 150.
+    addDamageMultiplier: 8.55,
     // The Sanctum bosses must out-hit their retuned NORMAL selves (normal
-    // floors them at 420 post-mitigation since the 2026-07 fresh-group
-    // retune): 19x lands 652-708, comfortably above.
+    // floors them at 200-301 post-mitigation since the v0.30 fresh-group
+    // pressure pass): 19x lands 652-708, comfortably above.
     damageMultiplierByMob: {
       korgath_the_bound: 19,
       grand_necromancer_velkhar: 19,
@@ -174,6 +264,23 @@ export const HEROIC_DUNGEON_TUNING: Record<string, HeroicDungeonTuning> = {
     },
     armorMultiplier: 1.2,
     finalBossId: 'korzul_the_gravewyrm',
+    marksPerParticipant: 1,
+  },
+  // Palmreach's open-field five-man. The broad route and two rare elites use
+  // the same level-22 Heroic pin as the other endgame leveling dungeons.
+  wildheart_basin: {
+    id: 'wildheart_basin',
+    difficulty: 'heroic',
+    level: 22,
+    healthMultiplier: 4.0,
+    // Solved at the basin's weakest spawn-list mob (wildheart_hexcaller,
+    // 455 post-mitigation at 15.5x): the open-field roster sits between
+    // Orkadia's casters and the Sanctum band.
+    damageMultiplier: 17.25,
+    // No Wildheart boss summons adds; kept at the half convention, inert.
+    addDamageMultiplier: 8.625,
+    armorMultiplier: 1.2,
+    finalBossId: 'wildheart_high_priest',
     marksPerParticipant: 1,
   },
   // The 10-player raid arena. The boss floors at 1200 post-mitigation on the

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { STATIONS } from '../src/sim/content/professions';
 import { ALL_RECIPES } from '../src/sim/content/recipes';
 import { archetypeCeilingFor } from '../src/sim/professions/archetype';
 import { requiredReagentCount } from '../src/sim/professions/crafting';
@@ -17,6 +18,7 @@ import {
   buildCraftingView,
   type CraftDifficulty,
   type CraftingIdentityLike,
+  craftingReagentSig,
   craftLearnHints,
   type RecipeDefLike,
 } from '../src/ui/crafting_view';
@@ -432,6 +434,14 @@ describe('buildCraftingView difficulty and skillReq', () => {
     expect(view.recipes[0].skillReq).toBe(75);
   });
 
+  it('surfaces content craft-cast durationSec on every row (Phase 2 chip source)', () => {
+    const items = table(item('recipe_dur_result'));
+    const field = buildCraftingView([{ ...recipe('recipe_field', []), skillReq: 0 }], [], items);
+    const mid = buildCraftingView([{ ...recipe('recipe_mid', []), skillReq: 50 }], [], items);
+    expect(field.recipes[0].durationSec).toBe(1.75);
+    expect(mid.recipes[0].durationSec).toBe(3);
+  });
+
   it('full at or above raw capability (this is how capability advances)', () => {
     // At capability: skill 100 (tier 4) vs skillReq 100 (tier 4).
     expect(difficultyFor(100, { cooking: 100 })).toBe('full');
@@ -453,6 +463,38 @@ describe('buildCraftingView difficulty and skillReq', () => {
     expect(difficultyFor(0, { cooking: 50 })).toBe('minimal');
     expect(difficultyFor(0, { cooking: 300 })).toBe('none'); // was 'full' pre-12c
     expect(difficultyFor(24, { cooking: 300 })).toBe('none');
+  });
+
+  it('at the craft content cap the label is none regardless of band (the learning-XP arm)', () => {
+    // The four-state curve alone can never reach gray for skillReq 75+
+    // (that needs capability past the 125 cap), so without the cap arm a
+    // maxed craft would read minimal, or even full for a tier-6 recipe,
+    // forever while the applied gain and the character-XP grant are zero.
+    expect(difficultyFor(75, { cooking: 125 })).toBe('none'); // was 'minimal'
+    expect(difficultyFor(150, { cooking: 125 })).toBe('none'); // was 'full'
+    // Just under the cap the recipe still teaches, so the band still shows
+    // (124.5 is tier 4: tier 5 begins exactly at the 125 cap, which is why
+    // a tier-3 recipe's minimal state only ever existed at the cap itself).
+    expect(difficultyFor(150, { cooking: 124.5 })).toBe('full');
+    expect(difficultyFor(75, { cooking: 124.5 })).toBe('reduced');
+    // Online pre-sync the skills mirror is EMPTY, and empty must never read
+    // as capped: with the majors identity the label rides the ordinary curve
+    // (full at capability 0) until the first cprof snapshot lands, the same
+    // pre-existing transient every difficulty state has. (With a NULL
+    // pre-sync identity the rare-ceiling arm reads 'none' for skillReq 75+
+    // on its own, so the majors identity is what isolates the cap arm here.)
+    expect(
+      difficultyFor(
+        75,
+        {},
+        {
+          synced: false,
+          activeArchetype: 'cooking',
+          pairedMajor: 'alchemy',
+          hobbyCraft: null,
+        },
+      ),
+    ).toBe('full');
   });
 
   it('pins the multiplier constants and their four-state difficulty mapping', () => {
@@ -741,7 +783,7 @@ describe('craftLearnHints (discoverability)', () => {
   it('hints a craft with unlearned trainer recipes at its station and master (positive)', () => {
     // Nothing learned: every stationed craft with a trainer recipe is hinted,
     // naming its station type and resident master.
-    const hints = craftLearnHints([]);
+    const hints = craftLearnHints([], STATIONS);
     expect(trainerRecipeIdsFor('weaponcrafting').length).toBeGreaterThan(0);
     expect(hints.get('weaponcrafting')).toEqual({
       stationType: 'forge',
@@ -752,11 +794,11 @@ describe('craftLearnHints (discoverability)', () => {
   it('drops the hint once every trainer recipe of the craft is known (fully-trained negative)', () => {
     const known = trainerRecipeIdsFor('weaponcrafting');
     expect(known.length).toBeGreaterThan(0);
-    expect(craftLearnHints(known).has('weaponcrafting')).toBe(false);
+    expect(craftLearnHints(known, STATIONS).has('weaponcrafting')).toBe(false);
   });
 
   it('never hints a craft with no physical station, and stays safe for unknown crafts', () => {
-    const hints = craftLearnHints([]);
+    const hints = craftLearnHints([], []);
     // Every hinted craft resolves to the station type it was paired with.
     for (const [craft, hint] of hints) {
       expect(stationTypeForCraft(craft)).toBe(hint.stationType);
@@ -766,5 +808,148 @@ describe('craftLearnHints (discoverability)', () => {
     // a bogus craft id is simply absent (no crash, no entry).
     expect(hints.has('jewelcrafting')).toBe(false);
     expect(hints.has('not-a-craft')).toBe(false);
+  });
+});
+
+// The crafting window is a MIRROR of the sim's reagent check, so the D8
+// downward substitution (a fine grade satisfies a requirement for its base)
+// has to reach it or the window refuses crafts the sim performs. That is not
+// a cosmetic mismatch: crafting_window.ts disables the Craft button on
+// `craftable` and re-guards the click on it, and eastbrook_vale is all tier-1
+// veins, so any tier-2 tool stops the plain grade dropping entirely.
+describe('buildCraftingView spans material grades', () => {
+  const gradeIdentity: CraftingIdentityLike = {
+    synced: true,
+    activeArchetype: null,
+    pairedMajor: null,
+    hobbyCraft: null,
+  };
+  const GRADE_ITEMS = table(
+    item('copper_ore'),
+    item('fine_copper_ore'),
+    item('recipe_grade_result'),
+  );
+  const gradeRecipe = recipe('recipe_grade', [{ itemId: 'copper_ore', count: 4 }]);
+
+  it('counts a fine grade toward its base, and the Craft button opens', () => {
+    const fineOnly: InvSlot[] = [{ itemId: 'fine_copper_ore', count: 4 }];
+    const view = buildCraftingView([gradeRecipe], fineOnly, GRADE_ITEMS);
+    expect(view.recipes[0].reagents[0]).toMatchObject({ have: 4, required: 4, satisfied: true });
+    expect(view.recipes[0].craftable).toBe(true);
+  });
+
+  it('a mixed bag sums both grades', () => {
+    const mixed: InvSlot[] = [
+      { itemId: 'copper_ore', count: 1 },
+      { itemId: 'fine_copper_ore', count: 3 },
+    ];
+    const view = buildCraftingView([gradeRecipe], mixed, GRADE_ITEMS);
+    expect(view.recipes[0].reagents[0].have).toBe(4);
+    expect(view.recipes[0].craftable).toBe(true);
+  });
+
+  it('substitution widens what counts, it does not waive the count', () => {
+    const short: InvSlot[] = [{ itemId: 'fine_copper_ore', count: 3 }];
+    const view = buildCraftingView([gradeRecipe], short, GRADE_ITEMS);
+    expect(view.recipes[0].reagents[0]).toMatchObject({ have: 3, satisfied: false });
+    expect(view.recipes[0].craftable).toBe(false);
+  });
+
+  it('fineSubstituted states exactly what the spend plan would take from the fine grade', () => {
+    // The substitution signal (the UX pass): base short by 3 of 4, so the
+    // craft would burn three fine copies, and the row says so.
+    const mixed: InvSlot[] = [
+      { itemId: 'copper_ore', count: 1 },
+      { itemId: 'fine_copper_ore', count: 5 },
+    ];
+    const mixedView = buildCraftingView([gradeRecipe], mixed, GRADE_ITEMS);
+    expect(mixedView.recipes[0].reagents[0]).toMatchObject({
+      satisfied: true,
+      fineSubstituted: 3,
+    });
+    // Base fully covers: no warning, even with fine copies in the bag.
+    const covered: InvSlot[] = [
+      { itemId: 'copper_ore', count: 4 },
+      { itemId: 'fine_copper_ore', count: 5 },
+    ];
+    const coveredView = buildCraftingView([gradeRecipe], covered, GRADE_ITEMS);
+    expect(coveredView.recipes[0].reagents[0]).toMatchObject({
+      satisfied: true,
+      fineSubstituted: 0,
+    });
+    // Unsatisfied rows warn about nothing (the craft will not run).
+    const short: InvSlot[] = [{ itemId: 'fine_copper_ore', count: 3 }];
+    const shortView = buildCraftingView([gradeRecipe], short, GRADE_ITEMS);
+    expect(shortView.recipes[0].reagents[0].fineSubstituted).toBe(0);
+    // Fully substituted (the phase 14 QA's missing arm): zero base held and
+    // the fine stock covers the WHOLE bill, so the suffix states the entire
+    // requirement.
+    const allFine: InvSlot[] = [{ itemId: 'fine_copper_ore', count: 4 }];
+    const allFineView = buildCraftingView([gradeRecipe], allFine, GRADE_ITEMS);
+    expect(allFineView.recipes[0].reagents[0]).toMatchObject({
+      satisfied: true,
+      fineSubstituted: 4,
+    });
+  });
+
+  it('the base never counts toward a FINE reagent (the gate stays one-directional)', () => {
+    const fineRecipe = recipe('recipe_fine_only', [{ itemId: 'fine_copper_ore', count: 4 }]);
+    const plainOnly: InvSlot[] = [{ itemId: 'copper_ore', count: 8 }];
+    const view = buildCraftingView([fineRecipe], plainOnly, GRADE_ITEMS);
+    expect(view.recipes[0].reagents[0]).toMatchObject({ have: 0, satisfied: false });
+    expect(view.recipes[0].craftable).toBe(false);
+  });
+
+  it('a self-signed FINE copy earns the displayed discount, matching what the sim charges', () => {
+    // The divergence this closes: the sim widened hasSelfSignedInstance across
+    // grades, so a window reading the declared id alone would show 4 while the
+    // craft charged 3.
+    const signedFine: InvSlot[] = [
+      { itemId: 'fine_copper_ore', count: 3, instance: { signer: 'Adventurer' } },
+    ];
+    const view = buildCraftingView(
+      [gradeRecipe],
+      signedFine,
+      GRADE_ITEMS,
+      {},
+      gradeIdentity,
+      new Set<StationType>(),
+      'Adventurer',
+    );
+    expect(view.recipes[0].reagents[0]).toMatchObject({ required: 3, have: 3, satisfied: true });
+    expect(view.recipes[0].craftable).toBe(true);
+    // Another player's signature earns nothing, on the fine grade too.
+    const tradedFine: InvSlot[] = [
+      { itemId: 'fine_copper_ore', count: 3, instance: { signer: 'Someoneelse' } },
+    ];
+    const traded = buildCraftingView(
+      [gradeRecipe],
+      tradedFine,
+      GRADE_ITEMS,
+      {},
+      gradeIdentity,
+      new Set<StationType>(),
+      'Adventurer',
+    );
+    expect(traded.recipes[0].reagents[0]).toMatchObject({ required: 4, satisfied: false });
+  });
+});
+
+describe('craftingReagentSig tracks every grade', () => {
+  it('a fine grade that no recipe names still moves the signature', () => {
+    // fine_copper_ore, fine_ironbark_log and fine_silverleaf_herb are reagents
+    // in NO recipe, so a declared-id-only signature would never converge an
+    // open window while the player gathered them (#2375).
+    const before = craftingReagentSig([], null);
+    const after = craftingReagentSig([{ itemId: 'fine_copper_ore', count: 5 }], null);
+    expect(after).not.toBe(before);
+  });
+
+  it('still ignores an item no recipe consumes in any grade', () => {
+    // The QUIET half: widening to grades must not turn the signature into a
+    // whole-bag hash that repaints on every grey drop.
+    const before = craftingReagentSig([], null);
+    const after = craftingReagentSig([{ itemId: 'greyjaw_fang', count: 5 }], null);
+    expect(after).toBe(before);
   });
 });

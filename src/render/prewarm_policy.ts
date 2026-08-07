@@ -15,9 +15,13 @@
 // This module is the DECISION layer (Three/DOM-free, deterministic, unit-tested);
 // renderer.ts is the thin consumer that runs the manifest the policy describes.
 
+import { EASTBROOK_LAYOUT } from '../sim/eastbrook_layout';
+
 /** Manifest entries a constrained device still runs; everything else is skipped. */
 export const CONSTRAINED_PREWARM_KEEP: readonly string[] = [
   'views.required',
+  'views.landmarks',
+  'views.persistent-portals',
   'views.nearby',
   'textures.scene',
   'programs.compile',
@@ -25,9 +29,96 @@ export const CONSTRAINED_PREWARM_KEEP: readonly string[] = [
   'render.settle-passes',
 ];
 
+/**
+ * Entries the minimal manifest still SKIPS at entry but whose explicit resume
+ * units run afterwards, in the same bounded background lane a deadline-dropped
+ * entry uses. This is the constrained-device answer to warm-up work that is too
+ * expensive for the entry window yet guaranteed to be needed seconds later: the
+ * ability-VFX impact sheets are procedurally drawn canvases whose first use is
+ * the first spell impact of that school, i.e. mid-combat.
+ *
+ * Membership is an opt-in per entry, never a blanket rule: everything else the
+ * minimal manifest skips is skipped for GPU-footprint reasons (the phone-class
+ * per-process memory ceiling) and must stay skipped. An id here is by
+ * construction NOT in CONSTRAINED_PREWARM_KEEP.
+ */
+export const CONSTRAINED_PREWARM_RESUME: readonly string[] = ['vfx.ability-primitives'];
+
 export const CONSTRAINED_TEXTURE_BATCH_SIZE = 4;
 export const CONSTRAINED_TEXTURE_MAX_MS = 1200;
 export const CONSTRAINED_ENTRY_VIEW_RAMP_MS = 300;
+export const NEARBY_LANDMARK_STREAM_RADIUS = 16;
+
+export interface MandatoryLandmarkCandidate {
+  kind: string;
+  templateId: string | null;
+  pos: { x: number; z: number };
+}
+
+export interface MandatoryLandmarkPartition<T> {
+  /** Service landmarks actionable from the current entry position. */
+  mandatory: T[];
+  /** Every other candidate, including remote service landmarks. */
+  ordinary: T[];
+}
+
+function authoredLandmarkInteractionRadius(templateId: string | null): number | null {
+  if (templateId === EASTBROOK_LAYOUT.services.mailbox.templateId) {
+    return EASTBROOK_LAYOUT.services.mailbox.interactionRadius;
+  }
+  if (templateId === EASTBROOK_LAYOUT.services.noticeboard.templateId) {
+    return EASTBROOK_LAYOUT.services.noticeboard.interactionRadius;
+  }
+  return null;
+}
+
+/** Runtime-streaming fallback priority. Entry readiness uses the mandatory
+ * radius-aware partition below and never relies on this ordinary queue rank. */
+export function interactionLandmarkViewPriority(
+  templateId: string | null,
+  distanceSq: number,
+): number | null {
+  if (authoredLandmarkInteractionRadius(templateId) === null) return null;
+  // A readable service landmark already inside the immediate town view should
+  // stream before the NPC backlog after entry. Farther landmarks retain their
+  // ordinary rank, so this never turns into whole-world eager instantiation.
+  return distanceSq <= NEARBY_LANDMARK_STREAM_RADIUS * NEARBY_LANDMARK_STREAM_RADIUS ? 0.5 : 1.5;
+}
+
+/**
+ * Separate actionable service landmarks from the ordinary entry backlog. Only the
+ * authored interaction radii qualify: recognizing a template never instantiates its
+ * view when the player entered elsewhere in the world.
+ */
+export function partitionMandatoryLandmarkCandidates<T extends MandatoryLandmarkCandidate>(
+  candidates: Iterable<T>,
+  origin: { x: number; z: number },
+): MandatoryLandmarkPartition<T> {
+  const mandatory: T[] = [];
+  const ordinary: T[] = [];
+  for (const candidate of candidates) {
+    const radius = authoredLandmarkInteractionRadius(candidate.templateId);
+    const dx = candidate.pos.x - origin.x;
+    const dz = candidate.pos.z - origin.z;
+    if (candidate.kind === 'object' && radius !== null && dx * dx + dz * dz <= radius * radius) {
+      mandatory.push(candidate);
+    } else ordinary.push(candidate);
+  }
+  return { mandatory, ordinary };
+}
+
+/** A landmark is entry-ready only after its real view exists and its bounded
+ * async-compile gate has cleared. No-parallel-compile views begin cleared. */
+export function mandatoryLandmarkViewsReady<T extends { compilePending: boolean }>(
+  mandatoryIds: readonly number[],
+  views: ReadonlyMap<number, T>,
+): boolean {
+  for (const id of mandatoryIds) {
+    const view = views.get(id);
+    if (!view || view.compilePending) return false;
+  }
+  return true;
+}
 
 export interface PrewarmPolicyInput {
   /** GFX.constrainedMemory: the phone-class memory-ceiling profile is active. */
@@ -36,6 +127,8 @@ export interface PrewarmPolicyInput {
   asyncCompileSupported: boolean;
   /** LOW_GFX: the Lambert/no-shadow tier (its own smaller view budget already). */
   lowGfx: boolean;
+  /** Keep desktop Insane's full manifest behind the entry cover instead of resuming it live. */
+  finishFullManifestBeforeReveal: boolean;
   /** Desktop defaults, injected so the constants stay owned by renderer.ts. */
   defaultMaxMs: number;
   constrainedMaxMs: number;
@@ -67,6 +160,29 @@ export interface PrewarmPolicy {
   textureBatchSize: number;
   /** Maximum wall-clock time for the bounded constrained texture pass. */
   textureMaxMs: number;
+  /** Ignore the soft manifest deadline so expensive work cannot spill into first live frames. */
+  finishFullManifestBeforeReveal: boolean;
+}
+
+/** True when a soft-deadline manifest entry should resume after world reveal. */
+export function prewarmEntryShouldDefer(
+  entryStartedMs: number,
+  deadlineMs: number,
+  deadlineExempt: boolean,
+  finishFullManifestBeforeReveal: boolean,
+): boolean {
+  return entryStartedMs >= deadlineMs && !deadlineExempt && !finishFullManifestBeforeReveal;
+}
+
+/** Build cutoff paired with the entry policy; full Insane prewarm does not trim archetypes. */
+export function prewarmBuildDeadline(
+  deadlineMs: number,
+  reserveMs: number,
+  finishFullManifestBeforeReveal: boolean,
+): number {
+  return finishFullManifestBeforeReveal
+    ? Number.MAX_SAFE_INTEGER
+    : deadlineMs - Math.max(0, reserveMs);
 }
 
 /**
@@ -89,6 +205,7 @@ export function resolvePrewarmPolicy(input: PrewarmPolicyInput): PrewarmPolicy {
       minimalManifest: false,
       textureBatchSize: 0,
       textureMaxMs: 0,
+      finishFullManifestBeforeReveal: input.finishFullManifestBeforeReveal,
     };
   }
   return {
@@ -109,6 +226,9 @@ export function resolvePrewarmPolicy(input: PrewarmPolicyInput): PrewarmPolicy {
     minimalManifest: true,
     textureBatchSize: CONSTRAINED_TEXTURE_BATCH_SIZE,
     textureMaxMs: CONSTRAINED_TEXTURE_MAX_MS,
+    // Never extend the loading gate on the constrained WebKit profile: its
+    // smaller manifest and hard deadline are process-survival requirements.
+    finishFullManifestBeforeReveal: false,
   };
 }
 
@@ -139,6 +259,16 @@ export function remainingPrewarmViewBudget(maxViews: number, createdViews: numbe
 export function prewarmEntryRuns(id: string, policy: PrewarmPolicy): boolean {
   if (!policy.minimalManifest) return true;
   return CONSTRAINED_PREWARM_KEEP.includes(id);
+}
+
+/**
+ * True when a minimal-manifest skip should still hand this entry's explicit
+ * units to the background resume lane. Only meaningful for an entry
+ * prewarmEntryRuns already rejected, so the unconstrained arm is always false.
+ */
+export function prewarmEntryResumesAfterSkip(id: string, policy: PrewarmPolicy): boolean {
+  if (!policy.minimalManifest) return false;
+  return CONSTRAINED_PREWARM_RESUME.includes(id);
 }
 
 /**
