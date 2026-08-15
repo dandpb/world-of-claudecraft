@@ -133,6 +133,7 @@ import {
 import { GROUND_PICKUP_LINES } from './content/ground_pickup_lines';
 import { MAGE_PET_MOBS } from './content/mage_pets';
 import { MAILBOXES } from './content/mailboxes';
+import { NECROMANCY_MOBS } from './content/necromancy';
 import {
   NIGHTBLOOM_CAMPS,
   NIGHTBLOOM_ITEMS,
@@ -359,6 +360,7 @@ export const MOBS: Record<string, MobTemplate> = {
   ...ZONE3_MOBS,
   ...DUNGEON_MOBS,
   ...WARLOCK_PET_MOBS,
+  ...NECROMANCY_MOBS,
   ...MAGE_PET_MOBS,
   ...TEMPLE_MOBS,
   ...TEMPLE_DUNGEON_MOBS,
@@ -922,7 +924,6 @@ export function zoneWelcomeText(
 // Legacy single-zone exports (zone 1) — still referenced by tests and the
 // starter-town logic.
 export { DEEPFEN_SHALLOWS_LAKE, GRAVEYARD_POS, LAKE, TOWN_RADIUS };
-export const ZONE_NAME = ZONE1_ZONE.name;
 
 // ---------------------------------------------------------------------------
 // Dungeons — private party instances at far-off flat origins (see
@@ -1058,10 +1059,8 @@ export function migrateLegacyInstancePos(pos: { x: number; z: number }): {
   return { x: dungeon.doorPos.x, z: dungeon.doorPos.z - 4 };
 }
 
-// Legacy aliases for the Hollow Crypt (tests + scripts reference these).
+// Legacy aliases for the Hollow Crypt (tests reference these).
 export const CRYPT_DOOR_POS = DUNGEONS.hollow_crypt.doorPos;
-export const CRYPT_ENTRY = DUNGEONS.hollow_crypt.entry;
-export const CRYPT_EXIT_OFFSET = DUNGEONS.hollow_crypt.exitOffset;
 export const CRYPT_SPAWNS = DUNGEONS.hollow_crypt.spawns;
 
 // ---------------------------------------------------------------------------
